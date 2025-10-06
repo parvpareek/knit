@@ -5,7 +5,8 @@ __pycache__/
 
 # C extensions
 *.so
-
+chromadb/
+test/
 # Distribution / packaging
 .Python
 build/
@@ -205,3 +206,33 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+node_modules
+dist
+dist-ssr
+*.local
+
+# Editor directories and files
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+agentic_tutor.db
+backend/markdown/
+backend/test/
+backend/chroma_db
