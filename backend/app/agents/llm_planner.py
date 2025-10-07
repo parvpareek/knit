@@ -32,11 +32,21 @@ class LLMPlannerAgent:
         self.completed_steps = []
         self.concept_attempts = {}  # Track how many times we've worked on each concept
         self.max_attempts_per_concept = 3  # Prevent getting stuck
+        
+        # CRITICAL FIX: Store all available concepts and track which are completed
+        self.all_concepts = []  # Store all extracted concepts
+        self.completed_topics = set()  # Track completed topic names
+        
+        # Store last decision reasoning for transparency
+        self.last_decision_reason = ""
     
     async def create_initial_plan(self, concepts: List[Dict], student_choice: str = "from_beginning", 
                                  document_outline: str = None, learning_roadmap: Dict = None) -> PlannerResponse:
         """Create initial study plan based on concepts, student choice, and document structure"""
         print(f"[{self.name}] Creating initial plan for {len(concepts)} concepts, choice: {student_choice}")
+        
+        # CRITICAL FIX: Store all concepts for later use when transitioning between topics
+        self.all_concepts = concepts
         
         try:
             # Get student profile
@@ -85,11 +95,14 @@ class LLMPlannerAgent:
             topic = completed_step.get("topic", "")
             self.concept_attempts[topic] = self.concept_attempts.get(topic, 0) + 1
             
-            # Read session memory context for this topic
+            # SIMPLIFIED: Read memory context for intelligent planning
             progress = {}
             next_segment = None
             recent_quiz = None
             unclear_segments = []
+            unmastered_objectives = []
+            recent_qa_count = 0
+            
             if self.memory and topic:
                 try:
                     progress = self.memory.get_topic_progress(topic) or {}
@@ -99,8 +112,15 @@ class LLMPlannerAgent:
                     if rq:
                         recent_quiz = rq[0]
                         unclear_segments = recent_quiz.get("unclear_segments", [])
-                except Exception:
-                    pass
+                    
+                    # Get engagement signals (no difficulty rating)
+                    unmastered_objectives = self.memory.get_unmastered_objectives(topic)
+                    recent_qa = self.memory.get_recent_qa(k=3)
+                    recent_qa_count = len(recent_qa)
+                    
+                    print(f"[{self.name}] Memory signals: unmastered_obj={len(unmastered_objectives)}, questions={recent_qa_count}")
+                except Exception as e:
+                    print(f"[{self.name}] Error reading memory signals: {e}")
 
             # Get current student profile
             student_profile = self._get_student_profile()
@@ -114,26 +134,66 @@ class LLMPlannerAgent:
                 student_questions=student_questions
             )
             
-            # Decide next action based on evaluation
-            next_action = self._decide_next_action(evaluation, quiz_results)
+            # Decide next action with memory signals (await since it's async)
+            next_action = await self._decide_next_action(
+                evaluation, 
+                quiz_results,
+                unmastered_count=len(unmastered_objectives),
+                engagement_level=recent_qa_count
+            )
             
             # Adapt plan if needed
             if next_action == "adapt_plan":
-                # Insert a remediation micro-segment targeting unclear segments if available
+                # Insert targeted remediation for unclear segments with DIFFERENT teaching approach
                 adapted_plan = list(self.current_plan or [])
                 if unclear_segments:
-                    top_seg = unclear_segments[0]
-                    adapted_plan.insert(self._current_index_or_end(), {
-                        "step_id": f"remediate_{top_seg}",
-                        "action": "study_segment",
-                        "topic": topic,
-                        "concept_id": completed_step.get("concept_id", ""),
-                        "segment_id": top_seg,
-                        "segment_title": f"Remediate {top_seg}",
-                        "difficulty": "easy",
-                        "est_minutes": 5,
-                        "why_assigned": "Targeted clarification based on recent quiz"
-                    })
+                    # Get segment performance details to determine remediation approach
+                    segment_perf = quiz_results.get("segment_performance", {})
+                    
+                    # Track remediation attempts to avoid infinite loops
+                    remediation_key = f"remediated:{topic}"
+                    if not hasattr(self, 'remediation_tracker'):
+                        self.remediation_tracker = {}
+                    
+                    # Remediate up to 2 most problematic segments
+                    for seg in unclear_segments[:2]:
+                        # Check if already remediated once
+                        already_remediated = self.remediation_tracker.get(f"{topic}:{seg}", 0)
+                        if already_remediated >= 2:
+                            print(f"[{self.name}] Segment {seg} already remediated {already_remediated} times, moving on")
+                            continue
+                        
+                        # Determine remediation strategy based on performance
+                        perf = segment_perf.get(seg, {})
+                        accuracy = perf.get("correct", 0) / perf.get("total", 1) if perf.get("total") else 0
+                        
+                        # Choose remediation approach
+                        if accuracy == 0:
+                            strategy = "fundamentals"
+                            why = f"Re-teach {seg} from scratch - fundamental misunderstanding detected"
+                        elif accuracy < 0.3:
+                            strategy = "examples"
+                            why = f"Re-explain {seg} with concrete examples - concept unclear"
+                        else:
+                            strategy = "practice"
+                            why = f"Targeted practice for {seg} - partial understanding"
+                        
+                        adapted_plan.insert(self._current_index_or_end(), {
+                            "step_id": f"remediate_{seg}_{already_remediated+1}",
+                            "action": "study_segment",
+                            "topic": topic,
+                            "concept_id": completed_step.get("concept_id", ""),
+                            "segment_id": seg,
+                            "segment_title": f"Re-learn: {seg}",
+                            "difficulty": "easy",
+                            "est_minutes": 5,
+                            "remediation_strategy": strategy,  # NEW: teaching approach hint
+                            "why_assigned": why
+                        })
+                        
+                        # Track remediation
+                        self.remediation_tracker[f"{topic}:{seg}"] = already_remediated + 1
+                        print(f"[{self.name}] 🔄 Inserting remediation for {seg}: strategy={strategy}, attempt={already_remediated+1}")
                 else:
                     adapted_plan = await self._llm_adapt_plan(
                         current_plan=self.current_plan,
@@ -146,19 +206,69 @@ class LLMPlannerAgent:
                 return PlannerResponse(
                     success=True,
                     plan=adapted_plan,
-                    reasoning=evaluation.get("reasoning", "Plan adapted based on performance"),
+                    reasoning=self.last_decision_reason or evaluation.get("reasoning", "Plan adapted based on performance"),
                     next_action="continue_plan",
                     evaluation=evaluation
                 )
             
             elif next_action == "continue_plan":
-                return PlannerResponse(
-                    success=True,
-                    plan=self.current_plan,
-                    reasoning="Progress is good, continuing with current plan",
-                    next_action="continue_plan",
-                    evaluation=evaluation
-                )
+                # CRITICAL FIX: Check if current plan has remaining steps
+                current_plan_copy = list(self.current_plan or [])
+                
+                # If current plan is empty or exhausted, try to move to next concept
+                if not current_plan_copy or len(current_plan_copy) <= len(self.completed_steps):
+                    print(f"[{self.name}] Current plan exhausted, checking for next segment/concept...")
+                    
+                    # Check if there's a next segment for current topic
+                    if next_segment:
+                        print(f"[{self.name}] Found next segment: {next_segment}")
+                        current_plan_copy.append({
+                            "step_id": f"study_{next_segment}",
+                            "action": "study_segment",
+                            "topic": topic,
+                            "concept_id": completed_step.get("concept_id", ""),
+                            "segment_id": next_segment,
+                            "segment_title": f"Next segment {next_segment}",
+                            "difficulty": "medium",
+                            "est_minutes": 8,
+                            "why_assigned": "Continue with next segment"
+                        })
+                        self.current_plan = current_plan_copy
+                    else:
+                        # No more segments, move to next concept
+                        print(f"[{self.name}] No more segments, moving to next concept...")
+                        if topic:
+                            self.completed_topics.add(topic)
+                        
+                        next_concept = self._get_next_uncompleted_concept()
+                        if next_concept:
+                            print(f"[{self.name}] Moving to next concept: {next_concept['label']}")
+                            new_plan = await self._create_plan_for_concept(next_concept)
+                            self.current_plan = new_plan
+                            return PlannerResponse(
+                                success=True,
+                                plan=new_plan,
+                                reasoning=self.last_decision_reason or "Great work! Moving to next concept.",
+                                next_action="continue_plan",
+                                evaluation=evaluation
+                            )
+                        else:
+                            print(f"[{self.name}] No more concepts available!")
+                            return PlannerResponse(
+                                success=True,
+                                plan=[],
+                                reasoning="All concepts completed! Great work!",
+                                next_action="complete",
+                                evaluation=evaluation
+                            )
+                
+                    return PlannerResponse(
+                        success=True,
+                        plan=self.current_plan,
+                        reasoning=self.last_decision_reason or "Progress is good, continuing with current plan",
+                        next_action="continue_plan",
+                        evaluation=evaluation
+                    )
             
             elif next_action == "move_forward":
                 # Student has mastered this concept, move to next major concept
@@ -177,17 +287,34 @@ class LLMPlannerAgent:
                         "why_assigned": "Advance to next segment in sequence"
                     })
                 else:
-                    next_plan = await self._llm_create_next_concept_plan(
-                        evaluation=evaluation,
-                        student_profile=student_profile,
-                        previous_concepts=self.completed_steps
-                    )
+                    # CRITICAL FIX: No more segments for current topic, find next concept
+                    # Mark current topic as completed
+                    if topic:
+                        self.completed_topics.add(topic)
+                        print(f"[{self.name}] Marked topic '{topic}' as completed")
+                    
+                    # Find next concept from original concept list
+                    next_concept = self._get_next_uncompleted_concept()
+                    
+                    if next_concept:
+                        print(f"[{self.name}] Moving to next concept: {next_concept['label']}")
+                        # Generate segment plan for this next topic
+                        next_plan = await self._create_plan_for_concept(next_concept)
+                    else:
+                        # No more concepts, try LLM fallback
+                        print(f"[{self.name}] No more concepts available, using LLM fallback")
+                        next_plan = await self._llm_create_next_concept_plan(
+                            evaluation=evaluation,
+                            student_profile=student_profile,
+                            previous_concepts=self.completed_steps
+                        )
+                
                 self.current_plan = next_plan
                 
                 return PlannerResponse(
                     success=True,
                     plan=next_plan,
-                    reasoning="Great progress! Moving to next major concept",
+                    reasoning=self.last_decision_reason or "Great progress! Moving to next major concept",
                     next_action="continue_plan",
                     evaluation=evaluation
                 )
@@ -197,7 +324,7 @@ class LLMPlannerAgent:
                 return PlannerResponse(
                     success=True,
                     plan=self.current_plan,
-                    reasoning=evaluation.get("reasoning", "Student needs clarification"),
+                    reasoning=self.last_decision_reason or evaluation.get("reasoning", "Student needs clarification"),
                     next_action="clarify_concept",
                     evaluation=evaluation
                 )
@@ -543,38 +670,178 @@ Return JSON array with 3-5 steps following the standard plan structure.
         
         return related[:3]  # Limit to 3 related concepts
     
-    def _decide_next_action(self, evaluation: Dict, quiz_results: Dict = None) -> str:
-        """Decide next action based on evaluation"""
-        # Deterministic rules first
-        if quiz_results and isinstance(quiz_results, dict) and "score_percentage" in quiz_results:
-            topic = quiz_results.get("topic", "")
-            score = quiz_results.get("score_percentage", 0.0) / 100.0 if quiz_results.get("score_percentage") > 1 else quiz_results.get("score_percentage", 0.0)
-            # Normalize score to 0..1
-            if score < 0.5:
-                return "clarify_concept"  # REMEDIATE/REPEAT
-            if 0.5 <= score < 0.8:
-                return "adapt_plan"  # add remedial micro-step
-            if score >= 0.8:
-                return "move_forward"
-
-        # Check if stuck on same concept
+    async def _decide_next_action_llm(self, evaluation: Dict, quiz_results: Dict = None, 
+                                      unmastered_count: int = 0, engagement_level: int = 0) -> tuple[str, str]:
+        """
+        🧠 AGENTIC PLANNER: Let LLM decide next action using rich context.
+        This makes the planner truly adaptive instead of rule-based.
+        
+        Returns:
+            tuple[str, str]: (action, reasoning)
+        """
+        # Build rich context for LLM decision
+        context_parts = []
+        
+        # 1. Quiz Performance
         if quiz_results:
-            topic = quiz_results.get("topic", "")
+            topic = quiz_results.get("topic", "Unknown")
+            score = quiz_results.get("score_percentage", 0.0)
+            unclear = quiz_results.get("unclear_segments", [])
+            context_parts.append(f"**Quiz Results:** {topic} - {score}% score")
+            if unclear:
+                context_parts.append(f"  - Unclear segments: {', '.join(unclear[:3])}")
+            
             attempts = self.concept_attempts.get(topic, 0)
-            if attempts >= self.max_attempts_per_concept:
-                print(f"[{self.name}] Warning: {attempts} attempts on {topic}, forcing move forward")
-                return "move_forward"
+            if attempts > 0:
+                context_parts.append(f"  - Previous attempts: {attempts}")
+        
+        # 2. Learning Patterns (if memory available)
+        if self.memory and quiz_results:
+            topic = quiz_results.get("topic")
+            try:
+                from app.core.learning_patterns import LearningPatternAnalyzer
+                analyzer = LearningPatternAnalyzer()
+                
+                # Get confusion patterns
+                recent_qa = self.memory.get_recent_qa(k=5)
+                if recent_qa:
+                    confusion = analyzer.detect_confusion_type(recent_qa[-1].get('q', ''), recent_qa)
+                    context_parts.append(f"**Confusion Pattern:** {confusion['confusion_type']} ({confusion['suggested_approach']})")
+                
+                # Get engagement profile
+                profile = analyzer.extract_engagement_profile(self.memory, topic)
+                context_parts.append(f"**Engagement:** {profile.get('engagement_level')} engagement, {profile.get('preferred_learning_style')} learner")
+                if profile.get('needs'):
+                    context_parts.append(f"  - Needs: {'; '.join(profile['needs'][:2])}")
+            except Exception as e:
+                print(f"[{self.name}] Could not analyze patterns: {e}")
+        
+        # 3. Mastery Status
+        if unmastered_count > 0:
+            context_parts.append(f"**Mastery:** {unmastered_count} objectives not yet mastered")
+        
+        if engagement_level > 0:
+            context_parts.append(f"**Engagement:** {engagement_level} recent questions asked")
+        
+        # 4. Evaluation insights
+        if evaluation:
+            if evaluation.get("needs_clarification"):
+                context_parts.append("**Evaluation:** Student needs clarification on concepts")
+            if evaluation.get("ready_for_next"):
+                context_parts.append("**Evaluation:** Student appears ready for next topic")
+        
+        context_str = "\n".join(context_parts) if context_parts else "Limited context available"
+        
+        # Ask LLM to decide
+        decision_prompt = f"""You are an adaptive learning planner. Based on student performance, decide the BEST next action.
 
-        # Fallback to LLM recommendation
-        recommendation = evaluation.get("recommendation", "continue_practice")
-        if recommendation == "move_forward" and evaluation.get("ready_for_next", False):
-            return "move_forward"
-        elif recommendation == "clarify_concept" and evaluation.get("needs_clarification", False):
-            return "clarify_concept"
-        elif recommendation == "adapt_plan":
-            return "adapt_plan"
-        else:
-            return "continue_plan"
+{context_str}
+
+Your options:
+1. **clarify_concept** - Student struggling, needs re-teaching with different approach
+2. **adapt_plan** - Moderate performance, needs targeted practice on weak areas
+3. **move_forward** - Strong performance, ready for next topic/concept
+4. **continue_plan** - Steady progress, continue current trajectory
+
+Consider:
+- Low scores (<50%) → usually need clarification
+- Moderate scores (50-80%) with confusion patterns → adapt teaching approach
+- High scores (>80%) with mastery → move forward
+- High engagement (many questions) might indicate confusion OR deep interest
+
+Respond with ONLY the action name (e.g., "clarify_concept") and brief 1-sentence reasoning.
+Format: ACTION: reasoning"""
+        
+        try:
+            response = await self.llm.ainvoke(decision_prompt)
+            response_text = response.content if hasattr(response, 'content') else str(response)
+            
+            # Parse response
+            action_map = {
+                "clarify": "clarify_concept",
+                "adapt": "adapt_plan",
+                "move_forward": "move_forward",
+                "move forward": "move_forward",
+                "continue": "continue_plan"
+            }
+            
+            for keyword, action in action_map.items():
+                if keyword in response_text.lower():
+                    reasoning = response_text.split(":")[-1].strip() if ":" in response_text else response_text
+                    print(f"[{self.name}] 🧠 LLM Decision: {action} - {reasoning[:100]}")
+                    
+                    # Log planner thinking
+                    from app.core.agent_thoughts import thoughts_tracker
+                    thoughts_tracker.add("Planner", f"Decision: {action} - {reasoning[:80]}", "🎯", {
+                        "action": action,
+                        "full_reasoning": reasoning
+                    })
+                    
+                    return (action, reasoning)
+            
+            print(f"[{self.name}] Could not parse LLM decision: {response_text[:200]}")
+        except Exception as e:
+            print(f"[{self.name}] LLM decision failed: {e}")
+        
+        # Fallback to simple rules
+        action = self._decide_next_action_fallback(evaluation, quiz_results, unmastered_count, engagement_level)
+        fallback_reason = self._get_fallback_reasoning(action, quiz_results)
+        return (action, fallback_reason)
+    
+    def _decide_next_action_fallback(self, evaluation: Dict, quiz_results: Dict = None, 
+                                     unmastered_count: int = 0, engagement_level: int = 0) -> str:
+        """Fallback rule-based decision if LLM fails"""
+        if quiz_results and "score_percentage" in quiz_results:
+            score = quiz_results.get("score_percentage", 0.0) / 100.0 if quiz_results.get("score_percentage") > 1 else quiz_results.get("score_percentage", 0.0)
+            
+            if score < 0.5:
+                return "clarify_concept"
+            elif score >= 0.8:
+                return "move_forward"
+            else:
+                return "adapt_plan"
+        
+        return "continue_plan"
+    
+    def _get_fallback_reasoning(self, action: str, quiz_results: Dict = None) -> str:
+        """Generate reasoning for fallback decisions"""
+        if quiz_results:
+            score = quiz_results.get("score_percentage", 0.0)
+            topic = quiz_results.get("topic", "this topic")
+            
+            if action == "clarify_concept":
+                return f"Score of {score}% indicates need for clarification on {topic} fundamentals"
+            elif action == "move_forward":
+                return f"Strong score of {score}% - ready to advance to next concept"
+            elif action == "adapt_plan":
+                return f"Moderate score of {score}% - adding targeted practice for {topic}"
+        
+        return "Continuing with steady progress through learning plan"
+    
+    async def _decide_next_action(self, evaluation: Dict, quiz_results: Dict = None, 
+                                   unmastered_count: int = 0, engagement_level: int = 0) -> str:
+        """
+        Async wrapper for LLM decision making.
+        Stores reasoning in self.last_decision_reason for use in PlannerResponse.
+        """
+        action = "continue_plan"
+        reasoning = "Continuing with current plan"
+        
+        try:
+            # Directly await the async LLM call (we're already in async context)
+            action, reasoning = await self._decide_next_action_llm(
+                evaluation, quiz_results, unmastered_count, engagement_level
+            )
+        except Exception as e:
+            print(f"[{self.name}] Async decision error: {e}, using fallback")
+            import traceback
+            traceback.print_exc()
+            action = self._decide_next_action_fallback(evaluation, quiz_results, unmastered_count, engagement_level)
+            reasoning = self._get_fallback_reasoning(action, quiz_results)
+        
+        # Store reasoning for use in PlannerResponse
+        self.last_decision_reason = reasoning
+        return action
     
     def _get_student_profile(self) -> Dict:
         """Get current student profile"""
@@ -686,11 +953,79 @@ Return JSON array with 3-5 steps following the standard plan structure.
         
         return plan
     
+    def _get_next_uncompleted_concept(self) -> Optional[Dict]:
+        """Find the next concept from the original list that hasn't been completed"""
+        print(f"[{self.name}] 🔍 Finding next concept | Total: {len(self.all_concepts)}, Completed: {self.completed_topics}")
+        
+        for i, concept in enumerate(self.all_concepts):
+            topic_name = concept.get("label", "")
+            concept_id = concept.get("concept_id", "")
+            print(f"[{self.name}]   Concept {i+1}: '{topic_name}' (ID: {concept_id}) - {'COMPLETED' if topic_name in self.completed_topics else 'AVAILABLE'}")
+            
+            if topic_name and topic_name not in self.completed_topics:
+                print(f"[{self.name}] ✅ Selected: '{topic_name}'")
+                return concept
+        
+        print(f"[{self.name}] ❌ No uncompleted concepts found")
+        return None
+    
+    async def _create_plan_for_concept(self, concept: Dict) -> List[Dict]:
+        """Create a study plan for a specific concept with segments"""
+        topic = concept.get("label", "Unknown Topic")
+        concept_id = concept.get("concept_id", "unknown")
+        
+        plan = []
+        
+        # Check if we have segment plan in memory for this topic
+        segment_plan = []
+        if self.memory:
+            try:
+                segment_plan = self.memory.get_segment_plan(topic)
+                if segment_plan:
+                    print(f"[{self.name}] Found {len(segment_plan)} segments for topic '{topic}' in memory")
+            except Exception as e:
+                print(f"[{self.name}] Could not retrieve segment plan: {e}")
+        
+        if segment_plan:
+            # Create plan steps from segment plan
+            for seg in segment_plan:
+                segment_id = seg.get("segment_id", "seg_1")
+                segment_title = seg.get("title", topic)
+                plan.append({
+                    "step_id": f"study_{segment_id}",
+                    "action": "study_segment",
+                    "topic": topic,
+                    "concept_id": concept_id,
+                    "segment_id": segment_id,
+                    "segment_title": segment_title,
+                    "difficulty": "medium",
+                    "est_minutes": seg.get("est_minutes", 10),
+                    "why_assigned": f"Learning {segment_title}"
+                })
+        else:
+            # Fallback: create a single study step for the whole topic
+            print(f"[{self.name}] No segment plan found, creating single study step for '{topic}'")
+            plan.append({
+                "step_id": f"study_{concept_id}",
+                "action": "study_segment",
+                "topic": topic,
+                "concept_id": concept_id,
+                "segment_id": "full_topic",
+                "segment_title": topic,
+                "difficulty": "medium",
+                "est_minutes": 15,
+                "why_assigned": f"Learning {topic}"
+            })
+        
+        return plan
+    
     def reset_state(self):
         """Reset planner state"""
         self.current_plan = None
         self.completed_steps = []
         self.concept_attempts = {}
+        self.all_concepts = []
+        self.completed_topics = set()
 
     def _current_index_or_end(self) -> int:
         try:

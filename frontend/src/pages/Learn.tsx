@@ -8,8 +8,9 @@ import { LoadingSpinner } from '@/components/LoadingSpinner';
 import { Button } from '@/components/ui/button';
 import LastSummaries from '@/components/LastSummaries';
 import EpisodicSummary from '@/components/EpisodicSummary';
+import { AgentThoughts } from '@/components/AgentThoughts';
 import { Input } from '@/components/ui/input';
-import { executeStep, askQuestion, submitExercise, submitDifficultyRating } from '@/api/tutorApi';
+import { executeStep, askQuestion, submitDifficultyRating } from '@/api/tutorApi';
 import { Send, FileCheck, ArrowRight, Frown, Meh, Smile, Laugh, ThumbsUp } from 'lucide-react';
 
 export default function Learn() {
@@ -18,13 +19,12 @@ export default function Learn() {
   const [input, setInput] = useState('');
   const [loading, setLoading] = useState(false);
   const [initialLoading, setInitialLoading] = useState(true);
-  const [exercises, setExercises] = useState<string[]>([]);
-  const [followUps, setFollowUps] = useState<string[]>([]);
+  const [exercises, setExercises] = useState<any[]>([]);
   const [exerciseAnswers, setExerciseAnswers] = useState<Record<string, string>>({});
-  const [exerciseSubmitted, setExerciseSubmitted] = useState(false);
   const [needsRating, setNeedsRating] = useState(false);
   const [ratingContext, setRatingContext] = useState<{topic: string; segment_id: string} | null>(null);
   const [submittedRating, setSubmittedRating] = useState(false);
+  const [agentThoughts, setAgentThoughts] = useState<any[]>([]);
   const messagesEndRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -65,7 +65,11 @@ export default function Learn() {
         addMessage({ role: 'tutor', content: 'Ready to start learning! Ask me any questions about the uploaded material.' });
       }
       setExercises(response.exercises || []);
-      setFollowUps(response.follow_ups || []);
+      
+      // Store agent thoughts if present
+      if (response.agent_thoughts) {
+        setAgentThoughts(response.agent_thoughts);
+      }
       
       // Check if rating is needed
       if (response.request_difficulty_rating && response.rating_context) {
@@ -101,6 +105,11 @@ export default function Learn() {
         content: response.answer || 'No answer provided',
         sources: response.sources 
       });
+      
+      // Store agent thoughts if present
+      if (response.agent_thoughts) {
+        setAgentThoughts(response.agent_thoughts);
+      }
     } catch (error) {
       addMessage({ role: 'tutor', content: 'Failed to get answer. Please try again.' });
     } finally {
@@ -148,7 +157,24 @@ export default function Learn() {
     setLoading(true);
     try {
       const nextStep = state.currentStep + 1;
-      const response = await executeStep(nextStep);
+      
+      // OPTIMIZATION: Collect exercise answers if any exist
+      const exerciseAnswersList = exercises.map((_, idx) => exerciseAnswers[idx] || '').filter(a => a.trim());
+      const hasAnswers = exerciseAnswersList.length > 0;
+      
+      // Pass exercise answers and current context to backend
+      const response = await executeStep(
+        nextStep,
+        hasAnswers ? exerciseAnswersList : undefined,
+        hasAnswers ? state.currentTopic : undefined,
+        hasAnswers ? state.currentSegmentId : undefined
+      );
+      
+      // Clear exercise state for next segment
+      if (hasAnswers) {
+        setExerciseAnswers({});
+        console.log(`[Learn] ✅ Sent ${exerciseAnswersList.length} exercise answers for evaluation`);
+      }
       
       // STEP 1 FIX: Update step AFTER successful response
       setCurrentStep(nextStep);
@@ -170,7 +196,11 @@ export default function Learn() {
         setPlannerReason(response.planner_reasoning || response.planner_reason || '');
       }
       setExercises(response.exercises || []);
-      setFollowUps(response.follow_ups || []);
+      
+      // Store agent thoughts if present
+      if (response.agent_thoughts) {
+        setAgentThoughts(response.agent_thoughts);
+      }
       
       // Check if rating is needed
       if (response.request_difficulty_rating && response.rating_context) {
@@ -214,9 +244,9 @@ export default function Learn() {
               </div>
             </div>
             <ProgressBar 
-              completed={state.progress.completed}
+              completed={state.currentStep}
               current={state.currentStep}
-              total={state.progress.total}
+              total={state.studyPlan.length || 1}
             />
             {state.plannerReason && (
               <div className="mt-2 text-sm text-muted-foreground">
@@ -230,6 +260,10 @@ export default function Learn() {
           <div className="max-w-4xl mx-auto p-4 space-y-6">
             <LastSummaries />
             <EpisodicSummary />
+            
+            {/* Agent Thoughts Panel */}
+            <AgentThoughts thoughts={agentThoughts} />
+            
             {initialLoading ? (
               <LoadingSpinner message="Loading study content..." />
             ) : (
@@ -237,45 +271,43 @@ export default function Learn() {
                 <ChatMessage key={idx} {...msg} />
               ))
             )}
-            {(exercises.length > 0 || followUps.length > 0) && (
-              <div className="bg-card border border-border rounded p-4">
-                <div className="text-sm font-semibold mb-2">Exercises & Follow-ups</div>
-                {[...new Set([...exercises, ...followUps])].map((q, i) => (
-                  <div key={i} className="mb-3">
-                    <div className="text-sm mb-1">{q}</div>
-                    <Input
-                      value={exerciseAnswers[q] || ''}
-                      onChange={(e) => setExerciseAnswers(prev => ({ ...prev, [q]: e.target.value }))}
-                      placeholder="Type your answer (optional)"
-                    />
-                    <div className="mt-2">
-                      <Button
-                        variant="outline"
-                        size="sm"
-                        onClick={async () => {
-                          try {
-                            if (exerciseAnswers[q]) {
-                              await submitExercise({
-                                topic: state.currentTopic,
-                                segment_id: state.currentSegmentId || 'unknown',
-                                prompt: q,
-                                student_answer: exerciseAnswers[q],
-                              });
-                              setExerciseSubmitted(true);
-                              addMessage({ role: 'tutor', content: 'Got it! Logged your exercise response.' });
-                            } else {
-                              addMessage({ role: 'tutor', content: 'Answer is empty; nothing recorded.' });
-                            }
-                          } catch {
-                            addMessage({ role: 'tutor', content: 'Failed to record exercise response.' });
-                          }
-                        }}
-                      >
-                        Submit
-                      </Button>
+            {exercises.length > 0 && (
+              <div className="bg-card border border-border rounded-lg p-4">
+                <div className="text-sm font-semibold text-primary mb-3 flex items-center gap-2">
+                  <span className="text-lg">✏️</span>
+                  Practice & Reflection (Optional)
+                </div>
+                <div className="text-xs text-muted-foreground mb-3">
+                  Answer what you can, then click "Next Step" to continue. Your answers will be evaluated automatically.
+                </div>
+                {exercises.map((ex, i) => {
+                  // Handle both old format (string) and new format (object)
+                  const question = typeof ex === 'string' ? ex : ex.question;
+                  const difficulty = typeof ex === 'object' && ex.difficulty ? ex.difficulty : null;
+                  
+                  return (
+                    <div key={i} className="mb-4 last:mb-0">
+                      <div className="flex items-center gap-2 mb-2">
+                        <div className="text-sm font-medium">{i + 1}. {question}</div>
+                        {difficulty && (
+                          <span className={`text-xs px-2 py-0.5 rounded ${
+                            difficulty === 'easy' ? 'bg-green-100 text-green-700' :
+                            difficulty === 'medium' ? 'bg-yellow-100 text-yellow-700' :
+                            'bg-red-100 text-red-700'
+                          }`}>
+                            {difficulty}
+                          </span>
+                        )}
+                      </div>
+                      <Input
+                        value={exerciseAnswers[i] || ''}
+                        onChange={(e) => setExerciseAnswers(prev => ({ ...prev, [i]: e.target.value }))}
+                        placeholder="Type your answer here (optional)..."
+                        className="bg-background"
+                      />
                     </div>
-                  </div>
-                ))}
+                  );
+                })}
               </div>
             )}
             {loading && <LoadingSpinner message="Thinking..." size="sm" />}

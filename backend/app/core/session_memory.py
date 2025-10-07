@@ -58,6 +58,18 @@ class SessionMemory:
             logger.error(f"Failed to get taught segment: {e}")
             return ""
     
+    def get_taught_segment_json(self, topic: str, segment_id: str) -> Optional[Dict[str, Any]]:
+        """Get structured taught segment JSON for a specific segment"""
+        try:
+            key = f"{self.prefix}:taught_json:{topic}:{segment_id}"
+            data = self.redis.get(key)
+            if data:
+                return json.loads(data)
+            return None
+        except Exception as e:
+            logger.error(f"Failed to get taught segment JSON: {e}")
+            return None
+    
     def get_all_taught_segments(self, topic: str) -> str:
         """Get all taught content for a topic (for cumulative quizzes)"""
         try:
@@ -346,6 +358,27 @@ class SessionMemory:
         except Exception as e:
             logger.error(f"Failed to get recent Q&A: {e}")
             return []
+    
+    def store_qa(self, question: str, answer: str, topic: str = None, metadata: Dict[str, Any] = None) -> bool:
+        """Store Q&A exchange with optional metadata (for exercise assessments, etc.)"""
+        try:
+            import time
+            key = f"{self.prefix}:qa_detailed"
+            exchange = {
+                "q": question,
+                "a": answer[:500],  # Store more detail than basic qa_history
+                "topic": topic,
+                "metadata": metadata or {},
+                "ts": time.time()
+            }
+            self.redis.lpush(key, json.dumps(exchange))
+            self.redis.ltrim(key, 0, 9)  # Keep last 10 detailed exchanges
+            self.redis.expire(key, self.default_ttl)
+            logger.info(f"Stored detailed Q&A exchange for {topic}")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to store detailed Q&A: {e}")
+            return False
     
     def get_weak_exercises(self, topic: str, segment_id: str) -> List[Dict[str, Any]]:
         """Get exercises student got wrong for a segment"""

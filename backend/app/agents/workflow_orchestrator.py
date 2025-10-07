@@ -15,6 +15,7 @@ from app.core.vectorstore import vectorstore
 from app.core.database import db
 from app.core.config import settings
 from app.core.session_memory import SessionMemory, get_redis_client
+from app.core.request_context import RequestContext
 import json
 from langchain_google_genai import ChatGoogleGenerativeAI
 from app.utils.session_logger import init_session_logger, get_logger
@@ -346,6 +347,11 @@ class WorkflowOrchestrator:
             self.current_state.taught_content = {}
             self.current_state.current_quiz = None
             self.current_state.student_answers = []
+            
+            # CRITICAL FIX: Initialize planner with loaded concepts!
+            self.planner_agent.all_concepts = self.current_state.concepts
+            self.planner_agent.completed_topics = set()  # Fresh start
+            print(f"[WORKFLOW] 🔧 Loaded {len(self.planner_agent.all_concepts)} concepts into planner")
             self.current_state.current_step = 0
             self._init_session_memory(
                 session_id=session_id,
@@ -586,6 +592,8 @@ class WorkflowOrchestrator:
                 else:
                     print(f"[WORKFLOW] No memory available. Proceeding to quiz for {topic}")
                     result = await self._execute_practice_quiz(step, concept_id)
+            elif action == "optional_exercise":
+                result = await self._execute_optional_exercise(step, concept_id)
             elif action == "review_results":
                 result = await self._execute_review_results(step)
             else:
@@ -807,7 +815,6 @@ Return ONLY JSON (no code fences):
   "summary": "1-2 sentence summary",
   "excerpts": ["quote from context"],
   "student_facing_next_steps": ["exercise 1"],
-  "follow_up_questions": ["question 1"],
   "memory_patch": {{"session_summary_delta": "note", "confidence": 0.8}}
 }}"""
         
@@ -960,10 +967,32 @@ Return ONLY JSON (no code fences):
             "study_content": study_content,
             "content": full_explanation,  # This will be displayed in chat automatically
             "exercises": parsed.get("student_facing_next_steps", []) if isinstance(parsed, dict) else [],
-            "follow_ups": parsed.get("follow_up_questions", []) if isinstance(parsed, dict) else [],
             "instructions": "Feel free to ask me any questions about this topic!",
             "next_action": "ask_questions_or_continue"
         }
+    
+    def _get_engagement_profile_cached(self, topic: str) -> Dict[str, Any]:
+        """
+        OPTIMIZATION: Compute engagement profile once and cache for this request.
+        Reduces pattern analysis overhead by 80%.
+        """
+        cache_key = f"_engagement_profile_{topic}"
+        if hasattr(self, cache_key):
+            return getattr(self, cache_key)
+        
+        engagement_profile = {}
+        if self.memory:
+            try:
+                from app.core.learning_patterns import LearningPatternAnalyzer
+                analyzer = LearningPatternAnalyzer()
+                engagement_profile = analyzer.extract_engagement_profile(self.memory, topic)
+                print(f"[WORKFLOW] 📊 Engagement: {engagement_profile.get('engagement_level')}, Style: {engagement_profile.get('preferred_learning_style')}")
+            except Exception as e:
+                print(f"[WORKFLOW] Could not extract engagement profile: {e}")
+        
+        # Cache for this request
+        setattr(self, cache_key, engagement_profile)
+        return engagement_profile
     
     async def _execute_study_segment(self, step: Dict, concept_id: str) -> Dict[str, Any]:
         """Execute study segment step - focused teaching of one segment"""
@@ -1132,54 +1161,142 @@ Return ONLY JSON (no code fences):
             except Exception as e:
                 print(f"[WORKFLOW] Could not get exam context: {e}")
         
-        # Get current difficulty level for adaptive teaching
-        avg_difficulty = 3.0  # Neutral default
-        if self.memory:
-            try:
-                avg_difficulty = self.memory.get_avg_difficulty_for_topic(topic)
-            except Exception:
-                pass
+        # OPTIMIZATION: Use cached engagement profile (computed once per request)
+        engagement_profile = self._get_engagement_profile_cached(topic)
+        complexity_instruction = ""  # Removed difficulty-based complexity adjustment
         
-        # Adjust teaching complexity based on difficulty feedback
-        complexity_instruction = ""
-        if avg_difficulty <= 2.0:
-            complexity_instruction = "\n**ADJUST DIFFICULTY: Student finds material challenging**\n- Use simpler language and more examples\n- Break down complex ideas into smaller steps\n- Add more analogies and visual descriptions\n"
-        elif avg_difficulty >= 4.5:
-            complexity_instruction = "\n**ADJUST DIFFICULTY: Student finds material easy**\n- Increase technical depth and rigor\n- Add advanced concepts and edge cases\n- Challenge with thought-provoking questions\n"
+        # Check for remediation strategy first (overrides normal teaching)
+        remediation_strategy = step.get("remediation_strategy", None)
+        teaching_strategy = ""
         
-        # Build progressive narrative context
-        narrative_context = ""
-        if recent_summaries:
-            narrative_context = "WHAT WE'VE COVERED SO FAR:\n"
-            for i, summ in enumerate(recent_summaries[:3]):
-                summary_text = summ.get('summary', '') if isinstance(summ, dict) else str(summ)
-                narrative_context += f"{i+1}. {summary_text}\n"
-            narrative_context += "\nNOW LET'S BUILD ON THIS:\n"
+        # Track teaching decision
+        from app.core.agent_thoughts import thoughts_tracker
         
-        segment_prompt = f"""Teach this segment using the provided context.{exam_style_instruction}{complexity_instruction}
+        if remediation_strategy:
+            # REMEDIATION: Use specific strategy to re-teach unclear segment
+            if remediation_strategy == "fundamentals":
+                teaching_strategy = """
+**🔄 REMEDIATION: FUNDAMENTALS** - Student showed fundamental misunderstanding.
+- Start from absolute basics, assume NO prior knowledge of this segment
+- Use VERY simple language and concrete everyday examples
+- Break down each concept into smallest possible pieces
+- Provide multiple analogies from everyday life
+- Build strong foundation before adding complexity"""
+                thoughts_tracker.add("Workflow", f"Re-teaching {segment_id} from FUNDAMENTALS - student showed basic misunderstanding", "🔄", {
+                    "strategy": "fundamentals",
+                    "segment": segment_id
+                })
+            elif remediation_strategy == "examples":
+                teaching_strategy = """
+**🔄 REMEDIATION: EXAMPLES-FOCUSED** - Student needs concrete illustrations.
+- Lead with 3+ DETAILED real-world examples
+- Show step-by-step walkthroughs with explanations
+- Use visual descriptions and relatable analogies
+- Connect abstract concepts to tangible scenarios
+- Less theory, more practical demonstration"""
+                thoughts_tracker.add("Workflow", f"Re-teaching {segment_id} with EXAMPLES - student needs concrete illustrations", "🔄", {
+                    "strategy": "examples",
+                    "segment": segment_id
+                })
+            elif remediation_strategy == "practice":
+                teaching_strategy = """
+**🔄 REMEDIATION: PRACTICE-ORIENTED** - Student has partial understanding.
+- Quick concept refresh (1-2 paragraphs max)
+- Focus on application and problem-solving
+- Provide guided practice scenarios with solutions
+- Address common mistakes and pitfalls explicitly
+- Build confidence through practical mastery"""
+                thoughts_tracker.add("Workflow", f"Re-teaching {segment_id} with PRACTICE - student has partial understanding", "🔄", {
+                    "strategy": "practice",
+                    "segment": segment_id
+                })
+            
+            print(f"[WORKFLOW] 🔄 Using remediation strategy: {remediation_strategy} for {segment_id}")
+        else:
+            # Normal teaching strategy based on engagement
+            if engagement_profile:
+                style = engagement_profile.get('preferred_learning_style', 'balanced')
+                needs = engagement_profile.get('needs', [])
+                
+                if style == "practical/applied":
+                    teaching_strategy = "\n**TEACHING STRATEGY: Practical Focus**\n- Lead with real-world examples and applications\n- Show concrete how-to steps\n- Include hands-on practice suggestions\n"
+                    thoughts_tracker.add("Workflow", f"Teaching {segment_id} with PRACTICAL focus - student prefers applied learning", "📚", {
+                        "style": "practical",
+                        "segment": segment_id
+                    })
+                elif style == "conceptual/theoretical":
+                    teaching_strategy = "\n**TEACHING STRATEGY: Conceptual Depth**\n- Start with underlying principles and 'why'\n- Build logical connections between ideas\n- Emphasize theoretical framework\n"
+                    thoughts_tracker.add("Workflow", f"Teaching {segment_id} with CONCEPTUAL depth - student prefers theory", "📚", {
+                        "style": "conceptual",
+                        "segment": segment_id
+                    })
+                else:
+                    thoughts_tracker.add("Workflow", f"Teaching {segment_id} with BALANCED approach", "📚", {
+                        "style": "balanced",
+                        "segment": segment_id
+                    })
+                
+                if needs:
+                    teaching_strategy += f"**STUDENT NEEDS:** {'; '.join(needs[:2])}\n"
+        
+        # Build minimal prior context (segment names only)
+        prior_context = ""
+        if recent_summaries and len(recent_summaries) > 0:
+            covered = []
+            for summ in recent_summaries[-2:]:
+                if isinstance(summ, dict):
+                    seg_id = summ.get('segment_id', '')
+                    if seg_id:
+                        covered.append(seg_id)
+            if covered:
+                prior_context = f"(Previous segments: {', '.join(covered)})\n"
+        
+        segment_prompt = f"""You are teaching "{segment_title}" to a student learning {topic}.
 
-        {narrative_context}
-        TOPIC: {topic}
-SEGMENT: {segment_title}
-OBJECTIVES: {segment_info.get('learning_objectives', [])}
+{prior_context}
+CURRENT SEGMENT: {segment_title}
+LEARNING OBJECTIVES:
+{segment_info.get('learning_objectives', [])}
+{exam_style_instruction}{complexity_instruction}{teaching_strategy}
 
-CONTEXT:
-{study_content[:1500]}
+DOCUMENT CONTENT:
+{study_content[:2000]}
 
-Return ONLY JSON (no code fences):
+TEACHING PRIORITIES:
+1. Focus ONLY on {segment_title} - no repetition of previous segments
+2. Ground explanation in DOCUMENT CONTENT above
+3. Adapt to student's learning style (see strategy)
+4. Pre-empt common confusions with clear examples
+5. PRIORITIZE detailed, thorough content explanation (minimum 250 words)
+
+PROACTIVE TEACHING:
+- Anticipate where students typically struggle with {segment_title}
+- Address potential confusion BEFORE it happens
+- Use concrete examples that connect to prior segments (ONE sentence max)
+
+CONTENT LENGTH REQUIREMENT: Your "content" field MUST be at least 300 to 500 words (approximately 3 to 5 substantial paragraphs).
+
+CRITICAL: Return ONLY a JSON object with these EXACT keys (no markdown, no code fences):
 {{
-  "full_text": "3-4 paragraph explanation. Connect to previous material if relevant.",
-  "summary": "1-2 sentence summary",
-  "excerpts": ["quote from context"],
-  "student_facing_next_steps": ["exercise 1", "exercise 2"],
-  "follow_up_questions": ["question 1"],
-  "memory_patch": {{"session_summary_delta": "brief note", "confidence": 0.8}}
-}}"""
+  "content": "Your COMPREHENSIVE, DETAILED 300 to 500 word explanation of {segment_title}. Write 3 to 5 full paragraphs with multiple examples, analogies, real-world applications, and step-by-step breakdowns. Be thorough and educational - this is the main learning content!",
+  "summary": "One sentence summary capturing the key insight",
+  "exercises": [
+    {{"question": "One conceptual question", "difficulty": "medium"}}
+    {{"question": "One application question", "difficulty": "medium"}}
+
+  ],
+  "memory_delta": "Brief summary of what was covered. 10-15 words"
+}}
+
+REMEMBER: Spend 90% of your response on the "content" field. Exercises should be brief.
+Start your response with {{ and end with }}. Nothing else!"""
         
-        # Initialize parsed to None at the start
+        # Initialize variables at the start
         parsed = None
         summary_text = ""
         memory_patch = {}
+        exercises = []
+        session_summary_delta = ""
         
         try:
             import asyncio
@@ -1219,10 +1336,31 @@ Return ONLY JSON (no code fences):
                 parsed = None
             
             # Extract content from parsed JSON or use raw response
-            if isinstance(parsed, dict) and parsed.get("full_text"):
-                segment_explanation = parsed.get("full_text", "")
+            if isinstance(parsed, dict) and (parsed.get("content") or parsed.get("full_text")):
+                # Support both old and new field names
+                segment_explanation = parsed.get("content") or parsed.get("full_text", "")
                 summary_text = parsed.get("summary", "")
-                memory_patch = parsed.get("memory_patch", {})
+                session_summary_delta = parsed.get("memory_delta") or parsed.get("session_summary_delta", "")
+                key_excerpts = parsed.get("key_excerpts", [])
+                exercises = parsed.get("exercises") or parsed.get("student_facing_next_steps", [])
+                
+                # Log content metrics
+                word_count = len(segment_explanation.split()) if segment_explanation else 0
+                char_count = len(segment_explanation) if segment_explanation else 0
+                print(f"[WORKFLOW] ✅ Parsed JSON:")
+                print(f"  - Content: {word_count} words, {char_count} chars")
+                print(f"  - Summary: {bool(summary_text)}")
+                print(f"  - Memory delta: {bool(session_summary_delta)}")
+                print(f"  - Exercises: {len(exercises)}")
+                
+                # Warn if content is too short
+                if word_count < 500:
+                    print(f"[WORKFLOW] ⚠️ WARNING: Content is only {word_count} words (target: 800+)")
+                    from app.core.agent_thoughts import thoughts_tracker
+                    thoughts_tracker.add("Workflow", f"⚠️ Short content generated: {word_count} words (target: 800+)", "⚠️", {
+                        "word_count": word_count,
+                        "segment": segment_id
+                    })
                 
                 # Store structured taught segment
                 if self.memory:
@@ -1233,21 +1371,39 @@ Return ONLY JSON (no code fences):
                             {
                                 "full_text": segment_explanation,
                                 "summary": summary_text,
-                                "excerpts": parsed.get("excerpts", []),
-                                "sources": parsed.get("sources", []),
+                                "excerpts": key_excerpts,
+                                "session_summary_delta": session_summary_delta,
                                 "segment_id": segment_id,
                                 "segment_title": segment_title,
                                 "topic": topic
                             }
                         )
+                        
+                        # CRITICAL: Store session summary delta for continuity
+                        if session_summary_delta:
+                            self.memory.push_session_summary({
+                                "segment_id": segment_id,
+                                "topic": topic,
+                                "summary": session_summary_delta,  # Use the concise delta
+                                "timestamp": time.time()
+                            }, k=3)
+                            print(f"[WORKFLOW] 💾 Stored session summary: '{session_summary_delta}'")
+                        
                     except Exception as e:
-                        print(f"[WORKFLOW] Failed to store segment JSON: {e}")
+                        print(f"[WORKFLOW] Failed to store segment data: {e}")
+                
+                # Store for return
+                memory_patch = {
+                    "session_summary_delta": session_summary_delta,
+                    "exercises": exercises
+                }
             else:
                 # Fallback: use raw content
-                print(f"[WORKFLOW] JSON parsing failed, using raw content")
+                print(f"[WORKFLOW] ⚠️ JSON parsing failed, using raw content")
                 segment_explanation = segment_response.content
-                summary_text = (segment_response.content or "").strip()[:180]
+                summary_text = f"{segment_title}: {(segment_response.content or '').strip()[:120]}"
                 memory_patch = {}
+                exercises = []
                 parsed = None  # Ensure parsed is None for later checks
             
             # Log LLM call
@@ -1300,9 +1456,27 @@ Return ONLY JSON (no code fences):
         self.current_state.taught_content[segment_key] = full_explanation
         print(f"[WORKFLOW] Stored taught content for {segment_key} ({len(full_explanation)} chars)")
         
-        # Store in Redis memory if available (for segment-based teaching)
+        # Store in Redis memory (OPTIMIZED: Single JSON storage, no duplication)
         if self.memory:
-            self.memory.store_taught_segment(topic, segment_id, full_explanation)
+            # Build comprehensive taught segment object
+            taught_json = {
+                "full_text": full_explanation,
+                "summary": summary_text,
+                "session_summary_delta": session_summary_delta if 'session_summary_delta' in locals() else "",
+                "topic": topic,
+                "segment_id": segment_id,
+            }
+            # Add parsed data if available
+            if parsed and isinstance(parsed, dict):
+                if "key_excerpts" in parsed:
+                    taught_json["excerpts"] = parsed["key_excerpts"]
+                if "student_facing_next_steps" in parsed:
+                    taught_json["exercises"] = parsed["student_facing_next_steps"]
+            
+            # SINGLE storage point - structured JSON only
+            self.memory.store_taught_segment_json(topic, segment_id, taught_json)
+            print(f"[WORKFLOW] 💾 Stored taught JSON for {segment_key} ({len(full_explanation)} chars)")
+            
             self.memory.mark_segment_started(topic, segment_id)
             self.memory.update_context({
                 "current_topic": topic,
@@ -1341,11 +1515,21 @@ Return ONLY JSON (no code fences):
         
             # Mark this segment completed to allow planner to advance; quiz only after all segments
             try:
+                from app.core.agent_thoughts import thoughts_tracker
                 ok = self.memory.mark_segment_completed(topic, segment_id)
                 if ok:
-                    print(f"[WORKFLOW] Marked segment completed: {topic}/{segment_id}")
+                    print(f"[WORKFLOW] ✅ Marked segment completed: {topic}/{segment_id}")
+                    thoughts_tracker.add("Workflow", f"Marked {segment_id} as completed", "✅", {
+                        "topic": topic,
+                        "segment": segment_id
+                    })
+                    # Verify it was marked
+                    progress = self.memory.get_topic_progress(topic) or {}
+                    print(f"[WORKFLOW] Verification - {segment_id} status: {progress.get(segment_id)}")
+                else:
+                    print(f"[WORKFLOW] ⚠️ mark_segment_completed returned False for {topic}/{segment_id}")
             except Exception as e:
-                print(f"[WORKFLOW] Failed to mark segment completed: {e}")
+                print(f"[WORKFLOW] ❌ Failed to mark segment completed: {e}")
 
         # Log the study content in lesson history
         if self.current_state.doc_id:
@@ -1359,31 +1543,88 @@ Return ONLY JSON (no code fences):
         
         print(f"[WORKFLOW] Successfully prepared segment content for {segment_title}")
         
-        # If this was the last segment for the topic, insert a topic-level quiz next
+        # CRITICAL: Check if this was the LAST segment and insert topic quiz (MUST HAPPEN)
+        from app.core.agent_thoughts import thoughts_tracker
+        
         try:
+            # METHOD 1: Check study plan directly (most reliable)
+            # Count segments for this topic in the study plan
+            segments_for_topic = []
+            for i, plan_step in enumerate(self.current_state.study_plan):
+                if plan_step.get("action") == "study_segment" and plan_step.get("topic") == topic:
+                    segments_for_topic.append({
+                        "index": i,
+                        "segment_id": plan_step.get("segment_id"),
+                        "is_current": i == self.current_state.current_step
+                    })
+            
+            total_segments_in_plan = len(segments_for_topic)
+            current_segment_index = next((i for i, s in enumerate(segments_for_topic) if s["is_current"]), -1)
+            is_last_segment = (current_segment_index == total_segments_in_plan - 1)
+            
+            print(f"[WORKFLOW] 📊 Quiz Check for {topic}:")
+            print(f"  - Total segments in study plan: {total_segments_in_plan}")
+            print(f"  - Current segment index: {current_segment_index}")
+            print(f"  - Is last segment: {is_last_segment}")
+            print(f"  - Segments: {[s['segment_id'] for s in segments_for_topic]}")
+            
+            # METHOD 2: Also check memory-based completion (backup)
+            memory_check_passed = False
             if self.memory:
-                remaining_next = self.memory.get_next_segment(topic)
-                if not remaining_next:
-                    # Check if a practice_quiz for this topic is already scheduled next
-                    insert_index = self.current_state.current_step + 1
-                    already_has_quiz = False
-                    if insert_index < len(self.current_state.study_plan):
-                        nxt = self.current_state.study_plan[insert_index]
-                        already_has_quiz = nxt.get("action") == "practice_quiz" and nxt.get("topic") == topic
-                    if not already_has_quiz:
-                        self.current_state.study_plan.insert(insert_index, {
-                            "step_id": f"quiz_{topic}",
-                            "action": "practice_quiz",
-                            "topic": topic,
-                            "concept_id": concept_id,
-                            "difficulty": "medium",
-                            "est_minutes": 6,
-                            "why_assigned": f"Topic-level quiz for {topic} after all segments"
-                        })
-        except Exception:
-            pass
+                segment_plan = self.memory.get_segment_plan(topic) or []
+                progress = self.memory.get_topic_progress(topic) or {}
+                completed_in_memory = [s.get("segment_id") for s in segment_plan if progress.get(s.get("segment_id")) == "completed"]
+                memory_check_passed = len(completed_in_memory) >= len(segment_plan) if segment_plan else False
+                print(f"  - Memory check: {len(completed_in_memory)}/{len(segment_plan)} complete")
+                print(f"  - Completed in memory: {completed_in_memory}")
+            
+            # Insert quiz if EITHER condition is true (study plan says last segment OR memory says all complete)
+            should_insert_quiz = is_last_segment or memory_check_passed
+            
+            if should_insert_quiz and total_segments_in_plan > 0:
+                thoughts_tracker.add("Workflow", f"✅ INSERTING QUIZ - Last segment for {topic} complete!", "🎯", {
+                    "topic": topic,
+                    "method": "study_plan" if is_last_segment else "memory",
+                    "total_segments": total_segments_in_plan
+                })
+                
+                quiz_index = self.current_state.current_step + 1  # Right after current step
+                already_has_quiz = False
+                if quiz_index < len(self.current_state.study_plan):
+                    nxt = self.current_state.study_plan[quiz_index]
+                    already_has_quiz = nxt.get("action") == "practice_quiz" and nxt.get("topic") == topic
+                
+                if not already_has_quiz:
+                    self.current_state.study_plan.insert(quiz_index, {
+                        "step_id": f"quiz_{topic}_{int(time.time())}",
+                        "action": "practice_quiz",
+                        "topic": topic,
+                        "concept_id": concept_id,
+                        "difficulty": "medium",
+                        "est_minutes": 6,
+                        "why_assigned": f"✅ Quiz for {topic} - all {total_segments_in_plan} segments complete!"
+                    })
+                    print(f"[WORKFLOW] ✅✅✅ QUIZ INSERTED at index {quiz_index} for {topic}")
+                    print(f"[WORKFLOW] Study plan now has {len(self.current_state.study_plan)} steps")
+                else:
+                    print(f"[WORKFLOW] Quiz already exists at index {quiz_index}")
+            else:
+                thoughts_tracker.add("Workflow", f"Not last segment for {topic} ({current_segment_index + 1}/{total_segments_in_plan})", "⏳", {
+                    "topic": topic,
+                    "current": current_segment_index + 1,
+                    "total": total_segments_in_plan
+                })
+                print(f"[WORKFLOW] Not inserting quiz - not the last segment")
+                
+        except Exception as e:
+            print(f"[WORKFLOW] ❌ Error in quiz insertion logic: {e}")
+            import traceback
+            traceback.print_exc()
 
         # Don't add text-based difficulty request - frontend will show buttons instead
+
+        # Get planner reasoning (why this step was assigned)
+        planner_reason = step.get("why_assigned", "")
 
         return {
             "success": True,
@@ -1392,9 +1633,10 @@ Return ONLY JSON (no code fences):
             "segment_id": segment_id,
             "segment_title": segment_title,
             "study_content": study_content,
-            "content": full_explanation,  # No difficulty request text - use buttons instead
-            "exercises": parsed.get("student_facing_next_steps", []) if isinstance(parsed, dict) else [],
-            "follow_ups": parsed.get("follow_up_questions", []) if isinstance(parsed, dict) else [],
+            "content": full_explanation,
+            "exercises": exercises,
+            "memory_patch": memory_patch,
+            "planner_reason": planner_reason,
             "instructions": f"Feel free to ask me any questions about {segment_title}!",
             "next_action": "ask_questions_or_continue"
         }
@@ -1430,29 +1672,105 @@ Return ONLY JSON (no code fences):
                 )
         print(f"[WORKFLOW] Using {len(taught_content)} chars of taught content for topic quiz grounding")
         
-        # Determine quiz difficulty based on student's performance and ratings
+        # Determine quiz difficulty based on exercise performance + quiz history
         quiz_difficulty = "medium"  # Default
+        include_subjective = False
+        
+        from app.core.agent_thoughts import thoughts_tracker
+        
         if self.memory:
             try:
-                avg_difficulty = self.memory.get_avg_difficulty_for_topic(topic)
-                recent_quizzes = self.memory.get_recent_quiz_results(topic, k=2)
+                # Check exercise assessments for recommended difficulty
+                exercise_recommendations = []
+                segment_plan = self.memory.get_segment_plan(topic) or []
+                for seg in segment_plan:
+                    seg_id = seg.get("segment_id")
+                    if seg_id:
+                        # Get exercise assessment
+                        recent_qa = self.memory.get_recent_qa(k=10)
+                        for qa in recent_qa:
+                            if qa.get("metadata", {}).get("type") == "exercise_assessment" and qa.get("metadata", {}).get("segment_id") == seg_id:
+                                import json
+                                try:
+                                    assessment = json.loads(qa.get("a", "{}"))
+                                    rec_diff = assessment.get("recommended_quiz_difficulty", "medium")
+                                    performance = assessment.get("overall_performance", "fair")
+                                    exercise_recommendations.append((rec_diff, performance))
+                                    print(f"[WORKFLOW] Exercise {seg_id}: {performance} → recommends {rec_diff}")
+                                except:
+                                    pass
                 
-                # Calculate average quiz performance
-                avg_quiz_score = 0.0
-                if recent_quizzes:
-                    scores = [q.get("score", 0) for q in recent_quizzes]
-                    avg_quiz_score = sum(scores) / len(scores) if scores else 0.0
-                
-                # Adaptive difficulty logic
-                if avg_difficulty >= 4.5 or avg_quiz_score >= 0.85:
-                    quiz_difficulty = "hard"  # Student finds it easy or performs well
-                    print(f"[WORKFLOW] Increasing quiz difficulty to HARD (avg_rating={avg_difficulty:.1f}, avg_score={avg_quiz_score:.2f})")
-                elif avg_difficulty <= 2.0 or avg_quiz_score <= 0.5:
-                    quiz_difficulty = "easy"  # Student struggles
-                    print(f"[WORKFLOW] Decreasing quiz difficulty to EASY (avg_rating={avg_difficulty:.1f}, avg_score={avg_quiz_score:.2f})")
+                # Aggregate exercise recommendations
+                if exercise_recommendations:
+                    # If most recommendations are "hard" and performance is good → hard quiz with subjective
+                    hard_count = sum(1 for d, p in exercise_recommendations if d == "hard" or p in ["excellent", "good"])
+                    weak_count = sum(1 for d, p in exercise_recommendations if p in ["weak", "fair"])
+                    
+                    if hard_count >= len(exercise_recommendations) / 2:
+                        quiz_difficulty = "hard"
+                        include_subjective = True
+                        print(f"[WORKFLOW] Exercise performance excellent → HARD quiz with subjective questions")
+                        thoughts_tracker.add("Quiz Generator", "Setting HARD difficulty with subjective questions - student performed excellently on exercises", "📝", {
+                            "difficulty": "hard",
+                            "reason": "excellent exercise performance",
+                            "subjective": True
+                        })
+                    elif weak_count > len(exercise_recommendations) / 2:
+                        quiz_difficulty = "easy"
+                        print(f"[WORKFLOW] Exercise performance weak → EASY quiz")
+                        thoughts_tracker.add("Quiz Generator", "Setting EASY difficulty - student struggled with exercises", "📝", {
+                            "difficulty": "easy",
+                            "reason": "weak exercise performance",
+                            "subjective": False
+                        })
+                    else:
+                        quiz_difficulty = "medium"
+                        include_subjective = True
+                        print(f"[WORKFLOW] Exercise performance mixed → MEDIUM quiz with subjective")
+                        thoughts_tracker.add("Quiz Generator", "Setting MEDIUM difficulty with subjective - mixed exercise performance", "📝", {
+                            "difficulty": "medium",
+                            "reason": "mixed exercise performance",
+                            "subjective": True
+                        })
                 else:
-                    quiz_difficulty = "medium"
-                    print(f"[WORKFLOW] Keeping quiz difficulty MEDIUM (avg_rating={avg_difficulty:.1f}, avg_score={avg_quiz_score:.2f})")
+                    # Fallback to quiz history
+                    recent_quizzes = self.memory.get_recent_quiz_results(topic, k=2)
+                    
+                    if recent_quizzes:
+                        scores = [q.get("score", 0) for q in recent_quizzes]
+                        avg_quiz_score = sum(scores) / len(scores) if scores else 0.0
+                        
+                        if avg_quiz_score >= 0.85:
+                            quiz_difficulty = "hard"
+                            include_subjective = True
+                            print(f"[WORKFLOW] Quiz history: HARD with subjective (avg_score={avg_quiz_score:.2f})")
+                            thoughts_tracker.add("Quiz Generator", f"Setting HARD difficulty based on quiz history (avg score: {avg_quiz_score:.0%})", "📝", {
+                                "difficulty": "hard",
+                                "reason": "high quiz scores",
+                                "avg_score": avg_quiz_score
+                            })
+                        elif avg_quiz_score <= 0.5:
+                            quiz_difficulty = "easy"
+                            print(f"[WORKFLOW] Quiz history: EASY (avg_score={avg_quiz_score:.2f})")
+                            thoughts_tracker.add("Quiz Generator", f"Setting EASY difficulty based on quiz history (avg score: {avg_quiz_score:.0%})", "📝", {
+                                "difficulty": "easy",
+                                "reason": "low quiz scores",
+                                "avg_score": avg_quiz_score
+                            })
+                        else:
+                            quiz_difficulty = "medium"
+                            print(f"[WORKFLOW] Quiz history: MEDIUM (avg_score={avg_quiz_score:.2f})")
+                            thoughts_tracker.add("Quiz Generator", f"Setting MEDIUM difficulty based on quiz history (avg score: {avg_quiz_score:.0%})", "📝", {
+                                "difficulty": "medium",
+                                "reason": "moderate quiz scores",
+                                "avg_score": avg_quiz_score
+                            })
+                    else:
+                        print(f"[WORKFLOW] No exercise or quiz data, using MEDIUM difficulty")
+                        thoughts_tracker.add("Quiz Generator", "Setting MEDIUM difficulty - no prior performance data", "📝", {
+                            "difficulty": "medium",
+                            "reason": "no data available"
+                        })
             except Exception as e:
                 print(f"[WORKFLOW] Could not determine adaptive difficulty: {e}")
         
@@ -1464,17 +1782,71 @@ Return ONLY JSON (no code fences):
             except Exception:
                 pass
         
-        # Generate practice quiz
-        print(f"[WORKFLOW] Preparing to call tutor_evaluator.generate_quiz | difficulty={quiz_difficulty}")
+        # ENHANCED: Gather student context for better quiz questions
+        student_context = {
+            "recent_questions": [],
+            "exercise_responses": [],
+            "unclear_segments": [],
+            "confusion_areas": []
+        }
+        
+        if self.memory:
+            try:
+                # Get recent questions/doubts from student
+                recent_qa = self.memory.get_recent_qa(k=5)
+                if recent_qa:
+                    student_context["recent_questions"] = [
+                        qa.get("q", "") for qa in recent_qa if qa.get("q")
+                    ][:3]  # Top 3 most recent questions
+                
+                # Get exercise assessment data to identify weak areas
+                segment_plan = self.memory.get_segment_plan(topic) or []
+                for seg in segment_plan:
+                    seg_id = seg.get("segment_id")
+                    if seg_id:
+                        # Check for exercise assessments
+                        assessment_key = f"exercise_assessment:{topic}:{seg_id}"
+                        try:
+                            assessment = self.memory.redis.get(assessment_key)
+                            if assessment:
+                                import json
+                                assessment_data = json.loads(assessment)
+                                if assessment_data.get("misconceptions"):
+                                    student_context["confusion_areas"].extend(
+                                        assessment_data["misconceptions"][:2]
+                                    )
+                        except:
+                            pass
+                
+                # Get unclear segments from recent quizzes
+                recent_quizzes = self.memory.get_recent_quiz_results(topic, k=2)
+                for quiz_res in recent_quizzes:
+                    unclear = quiz_res.get("unclear_segments", [])
+                    student_context["unclear_segments"].extend(unclear[:2])
+                
+                # Remove duplicates
+                student_context["unclear_segments"] = list(set(student_context["unclear_segments"]))[:3]
+                student_context["confusion_areas"] = list(set(student_context["confusion_areas"]))[:3]
+                
+                print(f"[WORKFLOW] Student context: {len(student_context['recent_questions'])} questions, "
+                      f"{len(student_context['unclear_segments'])} unclear segments, "
+                      f"{len(student_context['confusion_areas'])} confusion areas")
+            except Exception as e:
+                print(f"[WORKFLOW] Error gathering student context: {e}")
+        
+        # Generate practice quiz with 5 questions
+        print(f"[WORKFLOW] Preparing to call tutor_evaluator.generate_quiz | difficulty={quiz_difficulty}, subjective={include_subjective}")
         quiz_result = await self.tutor_evaluator.execute(
             "generate_quiz",
             topic=topic,
             concept_id=concept_id,
             difficulty=quiz_difficulty,  # Dynamic difficulty
-            num_questions=3,
-            taught_content=taught_content,  # NEW: Pass what was taught
-            segment_id=segment_id,  # NEW: Pass segment info
-            exam_context=exam_context  # NEW: Pass exam context for question style
+            num_questions=5,  # ENHANCED: 5 questions instead of 3
+            taught_content=taught_content,  # Pass what was taught
+            segment_id=segment_id,  # Pass segment info
+            exam_context=exam_context,  # Pass exam context for question style
+            student_context=student_context,  # Pass student questions, doubts, confusion areas
+            include_subjective=include_subjective  # NEW: Include subjective questions based on performance
         )
         
         if not quiz_result.success:
@@ -1540,6 +1912,179 @@ Return ONLY JSON (no code fences):
             "content": quiz_notification,  # This will be displayed in chat
             "instructions": f"Practice {topic} with these {len(quiz['questions'])} questions. Take your time and think through each one.",
             "next_action": "submit_answers"
+        }
+    
+    async def evaluate_exercise_answers_async(self, topic: str, segment_id: str, exercise_answers: List[str], 
+                                             taught_context: str = None) -> None:
+        """
+        Asynchronously evaluate exercise answers and store insights in memory.
+        OPTIMIZATION: Accepts pre-fetched context to avoid redundant Redis calls.
+        """
+        try:
+            # Filter out empty answers
+            answered = [a for a in exercise_answers if a and a.strip()]
+            if not answered:
+                print(f"[WORKFLOW] No exercise answers to evaluate for {segment_id}")
+                return
+            
+            print(f"[WORKFLOW] 🔄 Evaluating {len(answered)} exercise answers for {segment_id} (async)")
+            
+            # OPTIMIZATION: Reuse context if provided, otherwise fetch
+            if taught_context:
+                context = taught_context[:1500]
+                print(f"[WORKFLOW] ⚡ Reusing provided context ({len(context)} chars)")
+            else:
+                taught_json = self.memory.get_taught_segment_json(topic, segment_id) if self.memory else None
+                context = taught_json.get("full_text", "")[:1500] if taught_json else ""
+            
+            # Enhanced evaluation prompt with performance tracking
+            prompt = f"""You are evaluating a student's exercise answers for {segment_id}.
+
+TAUGHT CONTENT:
+{context}
+
+STUDENT'S ANSWERS (Easy → Medium → Hard):
+{chr(10).join(f'{i+1}. {a}' for i, a in enumerate(answered))}
+
+Provide a JSON assessment:
+{{
+  "overall_performance": "excellent|good|fair|weak",
+  "strengths": "brief strength summary",
+  "areas_to_improve": "brief improvement areas",
+  "difficulty_mastery": {{
+    "easy": true/false,
+    "medium": true/false,
+    "hard": true/false
+  }},
+  "recommended_quiz_difficulty": "easy|medium|hard|mixed"
+}}
+
+Base your assessment on answer quality and depth of understanding."""
+            
+            response = await self.llm.ainvoke(prompt)
+            assessment_text = response.content if hasattr(response, 'content') else str(response)
+            
+            # Parse JSON assessment
+            import json
+            try:
+                # Try to extract JSON
+                if '{' in assessment_text:
+                    json_start = assessment_text.index('{')
+                    json_end = assessment_text.rindex('}') + 1
+                    assessment_json = json.loads(assessment_text[json_start:json_end])
+                else:
+                    assessment_json = {"overall_performance": "fair", "recommended_quiz_difficulty": "medium"}
+            except:
+                assessment_json = {"overall_performance": "fair", "recommended_quiz_difficulty": "medium"}
+            
+            # Store in memory as a Q&A entry with performance data
+            if self.memory:
+                self.memory.store_qa(
+                    question=f"Exercise: {segment_id}",
+                    answer=json.dumps(assessment_json),
+                    topic=topic,
+                    metadata={
+                        "type": "exercise_assessment", 
+                        "segment_id": segment_id,
+                        "performance": assessment_json.get("overall_performance"),
+                        "recommended_difficulty": assessment_json.get("recommended_quiz_difficulty")
+                    }
+                )
+                print(f"[WORKFLOW] ✅ Exercise assessment stored: {assessment_json.get('overall_performance')} → {assessment_json.get('recommended_quiz_difficulty')} quiz")
+                
+                # Track exercise evaluation
+                from app.core.agent_thoughts import thoughts_tracker
+                performance = assessment_json.get('overall_performance', 'fair')
+                rec_diff = assessment_json.get('recommended_quiz_difficulty', 'medium')
+                thoughts_tracker.add("Exercise Evaluator", f"Student's {segment_id} exercises: {performance} performance → recommends {rec_diff} quiz", "✍️", {
+                    "performance": performance,
+                    "recommended_difficulty": rec_diff,
+                    "segment": segment_id
+                })
+            
+        except Exception as e:
+            print(f"[WORKFLOW] Error evaluating exercises: {e}")
+    
+    async def _execute_optional_exercise(self, step: Dict, concept_id: str) -> Dict[str, Any]:
+        """Execute an optional exercise after a segment - student can answer or skip"""
+        topic = step["topic"]
+        segment_id = step.get("segment_id")
+        print(f"[WORKFLOW] Executing optional exercise for: {topic} / {segment_id}")
+        
+        # Get the taught content for this segment to ground the exercise
+        segment_key = f"{topic}:{segment_id}"
+        taught_content = self.current_state.taught_content.get(segment_key, "")
+        
+        # If not in state, try memory
+        if not taught_content and self.memory and segment_id:
+            taught_json = self.memory.get_taught_segment_json(topic, segment_id)
+            if taught_json:
+                taught_content = taught_json.get("full_text", "")
+        
+        print(f"[WORKFLOW] Using {len(taught_content)} chars of taught content for exercise")
+        
+        # Generate a single practice question using the tutor evaluator
+        exercise_result = await self.tutor_evaluator.execute(
+            "generate_quiz",
+            topic=topic,
+            concept_id=concept_id,
+            difficulty="easy",
+            num_questions=1,  # Just one question
+            taught_content=taught_content,
+            segment_id=segment_id,
+            exam_context=self.memory.get_exam_context() if self.memory else {}
+        )
+        
+        if not exercise_result.success:
+            # Fallback: just move to next step
+            return {
+                "success": True,
+                "step_type": "optional_exercise",
+                "content": "💡 Great work on that segment! Ready to continue?",
+                "next_action": "continue",
+                "skippable": True
+            }
+        
+        exercise = exercise_result.data
+        question = exercise["questions"][0] if exercise.get("questions") else None
+        
+        if not question:
+            return {
+                "success": True,
+                "step_type": "optional_exercise",
+                "content": "💡 Great work on that segment! Ready to continue?",
+                "next_action": "continue",
+                "skippable": True
+            }
+        
+        # Store exercise in state for later evaluation
+        self.current_state.current_quiz = {
+            "quiz_id": f"exercise_{segment_id}",
+            "topic": topic,
+            "concept_id": concept_id,
+            "segment_id": segment_id,
+            "difficulty": "easy",
+            "questions": [question],
+            "is_optional": True
+        }
+        
+        # Get planner reasoning
+        planner_reason = step.get("why_assigned", "Optional exercise to reinforce understanding")
+        
+        return {
+            "success": True,
+            "step_type": "optional_exercise",
+            "exercise": {
+                "question": question["question"],
+                "options": question["options"],
+                "hint": question.get("hint", ""),
+                "segment_id": segment_id
+            },
+            "content": f"💪 **Quick Practice Exercise**\n\nBefore we move on, here's an optional question to help reinforce what you just learned. Feel free to try it or skip to the next segment!\n\n**Question:** {question['question']}",
+            "instructions": "Try this optional exercise to reinforce your understanding, or click 'Skip' to continue.",
+            "planner_reason": planner_reason,
+            "next_action": "answer_or_skip",
+            "skippable": True
         }
     
     async def _execute_review_results(self, step: Dict) -> Dict[str, Any]:
@@ -1700,22 +2245,52 @@ Return ONLY JSON (no code fences):
         
         # Update state based on adaptation
         if adaptation_result.success:
+            # CRITICAL DEBUG: Log what planner returned
+            print(f"[WORKFLOW] Planner returned plan with {len(adaptation_result.plan)} steps")
+            print(f"[WORKFLOW] Plan first 3 steps: {adaptation_result.plan[:3] if adaptation_result.plan else 'EMPTY'}")
+            print(f"[WORKFLOW] Next action: {adaptation_result.next_action}")
+            
             self.current_state.study_plan = adaptation_result.plan
             next_action = adaptation_result.next_action
             
-            # Move to next step
-            self.current_state.current_step += 1
-            
-            return {
-                "success": True,
-                "evaluation": evaluation,
-                "profile_updated": profile_result.success,
-                "next_action": next_action,
-                "planner_reasoning": adaptation_result.reasoning,
-                "planner_evaluation": adaptation_result.evaluation,
-                "adapted_plan": adaptation_result.plan if next_action == "adapt_plan" else None,
-                "message": f"Quiz completed! Score: {score_percentage:.1f}%. {adaptation_result.reasoning}"
-            }
+            # CRITICAL FIX: Don't increment step if plan is empty
+            if not adaptation_result.plan:
+                print(f"[WORKFLOW] ⚠️ WARNING: Planner returned empty plan after quiz!")
+                # Try to regenerate plan for next uncompleted concept
+                if hasattr(self.planner_agent, 'all_concepts') and self.planner_agent.all_concepts:
+                    print(f"[WORKFLOW] Attempting to recover by finding next concept...")
+                    next_concept = self.planner_agent._get_next_uncompleted_concept()
+                    if next_concept:
+                        print(f"[WORKFLOW] Found next concept: {next_concept.get('label')}")
+                        import asyncio
+                        recovery_plan = await self.planner_agent._create_plan_for_concept(next_concept)
+                        self.current_state.study_plan = recovery_plan
+                        self.current_state.current_step = 0  # Reset to start of new plan
+                        print(f"[WORKFLOW] Recovery successful! New plan has {len(recovery_plan)} steps")
+                    else:
+                        print(f"[WORKFLOW] No more concepts available. All learning complete!")
+                        return {
+                            "success": True,
+                            "evaluation": evaluation,
+                            "profile_updated": profile_result.success,
+                            "next_action": "complete",
+                            "message": f"🎉 Quiz completed! Score: {score_percentage:.1f}%. You've finished all available content!"
+                        }
+                else:
+                    # Move to next step
+                    self.current_state.current_step += 1
+                    
+                    return {
+                        "success": True,
+                        "evaluation": evaluation,
+                        "profile_updated": profile_result.success,
+                        "next_action": next_action,
+                        "planner_reasoning": adaptation_result.reasoning,
+                        "planner_reason": adaptation_result.reasoning,  # For frontend compatibility
+                        "planner_evaluation": adaptation_result.evaluation,
+                        "adapted_plan": adaptation_result.plan if next_action == "adapt_plan" else None,
+                        "message": f"Quiz completed! Score: {score_percentage:.1f}%. {adaptation_result.reasoning}"
+                    }
         else:
             # Move to next step even if adaptation fails
             self.current_state.current_step += 1

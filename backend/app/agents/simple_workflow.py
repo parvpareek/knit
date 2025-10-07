@@ -1040,61 +1040,123 @@ class TutorEvaluatorAgent:
             )
     
     async def _answer_question(self, question: str, topic: str = None, recent_summaries: Optional[List[Dict]] = None, recent_qa: Optional[List[Dict]] = None, current_segment_id: Optional[str] = None, current_segment_text: str = "") -> AgentResponse:
-        """Provide RAG-based answer to student question"""
+        """ENHANCED: Provide adaptive RAG-based answer using confusion pattern analysis"""
         print(f"[{self.name}] Answering question: {question}")
         
         try:
-            # Retrieve relevant content
-            # Strengthen retrieval query with current segment id when possible
+            # ENHANCEMENT: Detect confusion patterns
+            from app.core.learning_patterns import LearningPatternAnalyzer
+            from app.core.agent_thoughts import thoughts_tracker
+            
+            analyzer = LearningPatternAnalyzer()
+            
+            confusion_analysis = analyzer.detect_confusion_type(question, recent_qa or [])
+            confusion_type = confusion_analysis["confusion_type"]
+            is_repeat = confusion_analysis["is_repeat"]
+            approach = confusion_analysis["suggested_approach"]
+            
+            # Log agent thinking
+            thought = f"Detected {confusion_type} confusion. {'Repeat question - ' if is_repeat else ''}Strategy: {approach}"
+            thoughts_tracker.add("TutorEvaluator", thought, "🧠", {
+                "confusion_type": confusion_type,
+                "is_repeat": is_repeat,
+                "approach": approach
+            })
+            
+            print(f"[{self.name}] 🧠 Confusion: {confusion_type}, Repeat: {is_repeat}, Approach: {approach}")
+            
+            # Retrieve relevant content with enhanced query
             seg_hint = f" {current_segment_id}" if current_segment_id else ""
-            query = f"{question} {topic or ''}{seg_hint}"
-            results = self.vectorstore.query_top_k(query, k=3)
+            # Add confusion keywords to query
+            keywords = " ".join(confusion_analysis["keywords"])
+            query = f"{question} {topic or ''}{seg_hint} {keywords}"
+            results = self.vectorstore.query_top_k(query, k=4)  # More chunks for confused students
             
             documents = results.get('documents', [[]])[0] if 'documents' in results else []
             sources = results.get('metadatas', [[]])[0] if 'metadatas' in results else []
             
-            # Generate answer using LLM
-            # Build context: prefer current segment taught text, then retrieved docs
+            # Build context with priority to current segment
             context_parts = []
             if current_segment_text:
                 context_parts.append(current_segment_text[:2000])
             if documents:
-                context_parts.append("\n\n".join(documents))
+                context_parts.append("\n\n".join(documents[:3]))  # Top 3 chunks
             context = "\n\n".join([p for p in context_parts if p.strip()]) or "No relevant content found."
             summaries = recent_summaries or []
             
-            # Build Q&A history string for context
+            # Build Q&A history
             qa_history_str = ""
             if recent_qa:
                 qa_history_str = "\nRECENT CONVERSATION:\n"
                 for i, qa in enumerate(recent_qa[:3]):
                     qa_history_str += f"{i+1}. Student: {qa.get('q', '')}\n   You: {qa.get('a', '')[:150]}...\n"
             
-            prompt = f"""
-            You are a tutor helping a student who just learned about "{current_segment_id or topic or 'this topic'}".
+            # ADAPTIVE PROMPT based on confusion type
+            confusion_specific_instruction = {
+                "concept": """
+                STRATEGY: Definitional Clarity
+                - Start with a ONE-SENTENCE clear definition
+                - Follow with a concrete, relatable example
+                - Contrast with what it's NOT (common misconception)
+                - End with why it matters for their learning""",
+                
+                "application": """
+                STRATEGY: Step-by-Step Guidance  
+                - Break down the process into numbered steps
+                - Provide a worked example showing each step
+                - Highlight common mistakes to avoid
+                - Give them a similar problem to try""",
+                
+                "connection": """
+                STRATEGY: Relationship Building
+                - Explain how concepts relate using analogies
+                - Draw explicit connections to what they already know
+                - Use "bridge" concepts to link ideas
+                - Create a mini concept map in text""",
+                
+                "vague": """
+                STRATEGY: Comprehensive Recap
+                - Assume confusion about current segment
+                - Provide fresh explanation with different angle
+                - Use multiple examples and analogies
+                - Check for specific confusion points"""
+            }
             
-            Student's question: "{question}"
+            repeat_warning = """
+            ⚠️ CRITICAL: This is a REPEAT question - previous answer didn't work!
+            - Try a COMPLETELY DIFFERENT approach/analogy
+            - Use simpler language and more visual descriptions
+            - Break down into smaller pieces
+            - Ask clarifying questions to pinpoint confusion""" if is_repeat else ""
             
-            CURRENT SEGMENT CONTEXT (what we just taught):
+            prompt = f"""You are an adaptive tutor helping a student with "{current_segment_id or topic}".
+
+STUDENT'S QUESTION: "{question}"
+
+{repeat_warning}
+
+CONFUSION ANALYSIS:
+- Type: {confusion_type}
+- Recommended Approach: {approach}
+
+{confusion_specific_instruction.get(confusion_type, "")}
+
+CONTEXT FROM SEGMENT:
             {context[:2500]}
             
-            RECENT SESSION SUMMARIES (what we covered earlier):
-            {json.dumps(summaries)[:1200] if summaries else "No previous summaries"}
+PRIOR LEARNING:
+{json.dumps(summaries)[:800] if summaries else "First segment"}
             {qa_history_str}
             
-            INSTRUCTIONS:
-            - If the question is vague (like "I don't understand" or "explain simply"), assume they're asking about the CURRENT SEGMENT ({current_segment_id or topic})
-            - If they're asking about something we discussed before, reference the RECENT CONVERSATION (e.g., "Remember when you asked about X? Here's how that connects...")
-            - Provide a simplified recap of the current segment with:
-              * What it is (1-2 sentences)
-              * A concrete example or analogy
-              * Why it matters
-            - Use clear, simple language
-            - Use markdown for emphasis (**bold**, lists, etc.) but NO code fences unless showing code
-            - If they ask about something specific, answer that directly using the context
-            
-            Keep it student-friendly and encouraging! Build on what they've already learned.
-            """
+RESPONSE GUIDELINES:
+1. Address the {confusion_type} confusion directly
+2. Use the recommended strategy above
+3. Keep answer focused and structured (use headings, bullets)
+4. Include ONE concrete example that builds on their prior knowledge
+5. End with a quick comprehension checkpoint question
+6. Use encouraging, supportive tone
+
+Make your answer clear, actionable, and adapted to their confusion type!"""
             
             # Call LLM and log prompt/response to session log file
             import time
@@ -1124,10 +1186,19 @@ class TutorEvaluatorAgent:
                 reasoning=f"Answer generation failed: {str(e)}"
             )
     
-    async def _generate_quiz(self, topic: str, concept_id: str, difficulty: str = "medium", num_questions: int = 5, taught_content: str = "", segment_id: str = None, exam_context: Dict = None) -> AgentResponse:
-        """Generate quiz questions for a topic based on what was taught"""
-        print(f"[{self.name}] Generating {num_questions} {difficulty} questions for {topic}")
+    async def _generate_quiz(self, topic: str, concept_id: str, difficulty: str = "medium", num_questions: int = 5, taught_content: str = "", segment_id: str = None, exam_context: Dict = None, student_context: Dict = None, include_subjective: bool = False) -> AgentResponse:
+        """Generate quiz questions for a topic based on what was taught and student's learning context"""
+        print(f"[{self.name}] Generating {num_questions} {difficulty} questions for {topic} (subjective={include_subjective})")
         print(f"[{self.name}] Using {'taught content' if taught_content else 'retrieved context'} for grounding")
+        
+        # Parse student context for targeted questions
+        student_context = student_context or {}
+        student_questions = student_context.get("recent_questions", [])
+        unclear_segments = student_context.get("unclear_segments", [])
+        confusion_areas = student_context.get("confusion_areas", [])
+        
+        if student_questions or unclear_segments or confusion_areas:
+            print(f"[{self.name}] Using student context: {len(student_questions)} questions, {len(unclear_segments)} unclear, {len(confusion_areas)} confusions")
         
         # Parse exam context for question style
         exam_type = "general"
@@ -1163,11 +1234,24 @@ class TutorEvaluatorAgent:
         print(f"[{self.name}] Quiz tailored for exam type: {exam_type}")
         
         try:
-            # STEP 1 FIX: Prioritize taught content if available
+            # CRITICAL FIX: Use ALL taught content, distributed across segments
             if taught_content:
-                # Use what was actually taught as primary context
-                context = taught_content[:2000]  # Limit to first 2000 chars
-                print(f"[{self.name}] Using taught content ({len(context)} chars) for quiz generation")
+                # Split taught content into segments and sample from each
+                segments = taught_content.split("\n\n---\n\n")
+                print(f"[{self.name}] Found {len(segments)} taught segments, total {len(taught_content)} chars")
+                
+                # Take balanced samples from each segment (not just the last one!)
+                if len(segments) > 1:
+                    chars_per_segment = 800  # ~800 chars per segment
+                    context_parts = []
+                    for i, seg in enumerate(segments):
+                        if seg.strip():
+                            context_parts.append(f"[Segment {i+1}] {seg[:chars_per_segment]}")
+                    context = "\n\n".join(context_parts)
+                else:
+                    context = taught_content[:3000]  # Single segment, use more
+                
+                print(f"[{self.name}] Using balanced content ({len(context)} chars) from all segments for quiz")
             else:
                 # Fallback: retrieve from vector store
                 queries = [
@@ -1191,30 +1275,79 @@ class TutorEvaluatorAgent:
                 context = "\n\n---\n\n".join(documents) if documents else f"Topic: {topic}"
                 print(f"[{self.name}] Retrieved {len(documents)} unique chunks for quiz generation")
             
-            # Generate quiz using LLM - grounded in what was taught
+            # Build student context section for targeted questions
+            student_context_section = ""
+            if student_questions or unclear_segments or confusion_areas:
+                context_parts = []
+                if student_questions:
+                    context_parts.append(f"**Student's Recent Questions/Doubts:**\n" + "\n".join([f"- {q}" for q in student_questions[:3]]))
+                if unclear_segments:
+                    context_parts.append(f"**Segments Student Found Unclear:**\n" + "\n".join([f"- {s}" for s in unclear_segments]))
+                if confusion_areas:
+                    context_parts.append(f"**Areas of Confusion:**\n" + "\n".join([f"- {c}" for c in confusion_areas]))
+                
+                student_context_section = f"""
+**STUDENT LEARNING CONTEXT** (create questions targeting these areas):
+{chr(10).join(context_parts)}
+
+IMPORTANT: Prioritize questions that address the student's questions, doubts, and unclear areas above.
+At least {min(3, num_questions)} questions should directly relate to their learning context.
+"""
+            
+            # Build question type instruction based on include_subjective
+            question_type_instruction = ""
+            if include_subjective:
+                question_type_instruction = f"""
+**QUESTION MIX** (for {num_questions} questions):
+- {num_questions - 2} Multiple-Choice (MCQ) questions: type="mcq", options array, correct_answer
+- {min(2, num_questions - 2)} Subjective questions: type="subjective", no options/correct_answer, just question + explanation
+
+SUBJECTIVE QUESTIONS should:
+- Ask students to explain a concept in their own words
+- Require analysis, synthesis, or application
+- Test deeper understanding beyond memorization
+- Example: "Explain how X relates to Y and provide an example"
+"""
+            else:
+                question_type_instruction = f"""
+**ALL {num_questions} questions should be Multiple-Choice (MCQ)**:
+- Each must have: type="mcq", question, options (4 strings), correct_answer (A/B/C/D)
+"""
+            
+            # Generate quiz using LLM - grounded in what was taught and student's learning context
             segment_context = f" for segment {segment_id}" if segment_id else ""
             prompt = f"""
-            You are a strict JSON generator. Create {num_questions} {difficulty} difficulty multiple-choice questions about {topic}{segment_context}.
+            You are a strict JSON generator. Create {num_questions} {difficulty} difficulty questions about {topic}{segment_context}.
 {exam_style_instruction}
+{student_context_section}
+{question_type_instruction}
             Constraints:
             - Base ALL questions ONLY on TAUGHT CONTENT below.
+            - If student context is provided, ensure questions target their doubts, unclear areas, and confusion points.
             - Return ONLY a JSON array (no prose, no code fences, no keys outside the schema).
-            - Each object MUST contain keys: question, options (array of 4 strings), correct_answer (A|B|C|D), explanation, hint, segment_hint.
+            
+            MCQ Format:
+            {{
+              "type": "mcq",
+              "question": "...",
+              "options": ["A ...", "B ...", "C ...", "D ..."],
+              "correct_answer": "A",
+              "explanation": "...",
+              "hint": "...",
+              "segment_hint": "general"
+            }}
+            
+            SUBJECTIVE Format (if applicable):
+            {{
+              "type": "subjective",
+              "question": "Explain/Analyze/Compare...",
+              "explanation": "Model answer or key points to cover",
+              "hint": "...",
+              "segment_hint": "general"
+            }}
 
             TAUGHT CONTENT (source of truth):
             {context}
-
-            Example JSON (structure only):
-            [
-              {{
-                "question": "...",
-                "options": ["A ...", "B ...", "C ...", "D ..."],
-                "correct_answer": "A",
-                "explanation": "...",
-                "hint": "...",
-                "segment_hint": "general"
-              }}
-            ]
             """
             
             # Call LLM and log prompt/response to session log file
@@ -1231,18 +1364,28 @@ class TutorEvaluatorAgent:
             try:
                 # Try to parse JSON, handle cases where LLM adds extra text or fences
                 content = (response.content or "").strip()
+                
+                # CRITICAL FIX: Proper code fence removal
                 if content.startswith('```'):
-                    if '```json' in content:
-                        content = content.split('```json', 1)[1]
-                    parts = content.split('```')
-                    if len(parts) >= 2:
-                        content = parts[1]
+                    # Remove opening fence (```json or ```)
+                    if content.startswith('```json'):
+                        content = content[7:]  # Remove ```json
+                    elif content.startswith('```'):
+                        content = content[3:]  # Remove ```
+                    
+                    # Remove closing fence if present
+                    if '```' in content:
+                        content = content.split('```')[0]
+                    
+                    content = content.strip()
+                
                 # Find first JSON array if extra prose remains
-                if not content.strip().startswith('['):
+                if not content.startswith('['):
                     import re
                     m = re.search(r"\[[\s\S]*\]", content)
                     if m:
                         content = m.group(0)
+                
                 # Validate minimal JSON
                 questions = json.loads(content)
                 if not isinstance(questions, list) or not questions:
@@ -1303,26 +1446,59 @@ class TutorEvaluatorAgent:
                     reasoning="Number of answers doesn't match number of questions"
                 )
             
-            # Evaluate each answer
+            # Evaluate each answer and track unclear segments
             correct_count = 0
             results = []
+            unclear_segments = []  # Track which segments student struggled with
+            segment_performance = {}  # Track performance by segment
             
             for i, (question, answer) in enumerate(zip(questions, student_answers)):
-                is_correct = answer.upper() == question.get("correct_answer", "").upper()
+                q_type = question.get("type", "mcq")
+                
+                # Evaluate based on question type
+                if q_type == "mcq":
+                    is_correct = answer.upper() == question.get("correct_answer", "").upper()
+                elif q_type == "subjective":
+                    # For subjective, we'll need LLM evaluation later
+                    # For now, mark as "needs_review"
+                    is_correct = None  # Will be evaluated separately
+                else:
+                    is_correct = answer.upper() == question.get("correct_answer", "").upper()
+                
                 if is_correct:
                     correct_count += 1
+                
+                # Track segment performance
+                segment_hint = question.get("segment_hint", "general")
+                if segment_hint not in segment_performance:
+                    segment_performance[segment_hint] = {"correct": 0, "total": 0}
+                
+                segment_performance[segment_hint]["total"] += 1
+                if is_correct:
+                    segment_performance[segment_hint]["correct"] += 1
                 
                 results.append({
                     "question_id": f"q{i+1}",
                     "student_answer": answer,
-                    "correct_answer": question.get("correct_answer", ""),
+                    "correct_answer": question.get("correct_answer", "") if q_type == "mcq" else None,
                     "is_correct": is_correct,
                     "explanation": question.get("explanation", ""),
-                    "hint": question.get("hint", "")
+                    "hint": question.get("hint", ""),
+                    "segment_hint": segment_hint,
+                    "question_type": q_type
                 })
             
-            # Calculate score
-            total_questions = len(questions)
+            # Identify unclear segments (segments with <50% accuracy)
+            for segment, perf in segment_performance.items():
+                if segment != "general" and perf["total"] > 0:
+                    accuracy = perf["correct"] / perf["total"]
+                    if accuracy < 0.5:  # Less than 50% correct
+                        unclear_segments.append(segment)
+                        print(f"[{self.name}] ⚠️ Unclear segment: {segment} ({perf['correct']}/{perf['total']})")
+            
+            # Calculate score (only count MCQ questions for now)
+            mcq_count = sum(1 for q in questions if q.get("type", "mcq") == "mcq")
+            total_questions = mcq_count if mcq_count > 0 else len(questions)
             score_percentage = (correct_count / total_questions) * 100 if total_questions > 0 else 0
             
             evaluation = {
@@ -1331,7 +1507,9 @@ class TutorEvaluatorAgent:
                 "total_questions": total_questions,
                 "correct_answers": correct_count,
                 "score_percentage": score_percentage,
-                "results": results
+                "results": results,
+                "unclear_segments": unclear_segments,  # NEW: Segments that need remediation
+                "segment_performance": segment_performance  # NEW: Detailed performance by segment
             }
             
             return AgentResponse(

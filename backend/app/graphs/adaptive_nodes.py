@@ -102,6 +102,10 @@ async def planner_node(state: AdaptiveState, planner: LLMPlannerAgent, memory: S
                 else:
                     next_action = "quiz"
                     reason = "All segments complete; scheduling topic-level quiz"
+            elif step_type == "optional_exercise":
+                # CRITICAL FIX: Route exercises to quiz node
+                next_action = "quiz"
+                reason = f"Optional exercise for {step.get('segment_id', 'segment')}"
             else:
                 next_action = "teach"
                 segment_title = step.get('segment_title') or step.get('segment_id') or 'segment'
@@ -172,6 +176,14 @@ async def tutor_node(state: AdaptiveState, tutor: TutorEvaluatorAgent, memory: S
             result = await orchestrator._execute_study_segment(step, concept_id)
         elif action == "study_topic":
             result = await orchestrator._execute_study_topic(step, concept_id)
+        elif action in ["optional_exercise", "practice_quiz"]:
+            # CRITICAL FIX: Don't teach for exercises/quizzes - wrong node!
+            print(f"[TUTOR_NODE] ⚠️ Action '{action}' should not be in tutor_node - routing issue!")
+            result = {
+                "success": True,
+                "content": f"Routing error: {action} in tutor node",
+                "next_action": "continue"
+            }
         else:
             # Planner may have deferred a quiz to teach; synthesize next segment
             try:
@@ -308,19 +320,23 @@ async def assess_node(state: AdaptiveState, tutor: TutorEvaluatorAgent, memory: 
 
 async def quiz_node(state: AdaptiveState, tutor: TutorEvaluatorAgent, memory: SessionMemory, orchestrator=None) -> AdaptiveState:
     """
-    Generates and administers topic-level quiz after all segments.
-    Delegates to orchestrator's _execute_practice_quiz.
+    Generates quiz or optional exercise.
+    Delegates to orchestrator's _execute_practice_quiz or _execute_optional_exercise.
     """
-    print(f"[QUIZ_NODE] Generating quiz for topic: {state['current_topic']}")
-    
     topic = state["current_topic"]
     step = state["study_plan"][state["current_step_index"]] if state["current_step_index"] < len(state["study_plan"]) else {}
+    action = step.get("action", "practice_quiz")
     concept_id = step.get("concept_id")
     
-    # Delegate to orchestrator's quiz generation
+    print(f"[QUIZ_NODE] Handling '{action}' for topic: {topic}")
+    
+    # Delegate to appropriate executor
     result = {}
     if orchestrator:
-        result = await orchestrator._execute_practice_quiz(step, concept_id)
+        if action == "optional_exercise":
+            result = await orchestrator._execute_optional_exercise(step, concept_id)
+        else:
+            result = await orchestrator._execute_practice_quiz(step, concept_id)
     else:
         # Fallback
         result = {

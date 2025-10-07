@@ -42,13 +42,27 @@ export const startFromSaved = async (savedSessionId: string, studentChoice: stri
   return response.json();
 };
 
-export const executeStep = async (stepIndex: number | null = null) => {
+export const executeStep = async (
+  stepIndex: number | null = null, 
+  exerciseAnswers?: string[], 
+  lastTopic?: string,
+  lastSegmentId?: string
+) => {
+  const payload: any = { step_index: stepIndex };
+  
+  // Add exercise answers if provided
+  if (exerciseAnswers && exerciseAnswers.length > 0 && lastTopic && lastSegmentId) {
+    payload.exercise_answers = exerciseAnswers;
+    payload.last_topic = lastTopic;
+    payload.last_segment_id = lastSegmentId;
+  }
+  
   const response = await fetch(`${API_BASE_URL}/simple-tutor/execute-step`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
     },
-    body: JSON.stringify({ step_index: stepIndex }),
+    body: JSON.stringify(payload),
   });
   
   if (!response.ok) {

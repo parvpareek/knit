@@ -15,6 +15,7 @@ export default function Quiz() {
   const [answers, setAnswers] = useState<string[]>([]);
   const [showHelp, setShowHelp] = useState(false);
   const [loading, setLoading] = useState(false);
+  const [submitted, setSubmitted] = useState(false); // Prevent duplicate submissions
 
   if (!state.currentQuiz) {
     navigate('/learn');
@@ -34,17 +35,22 @@ export default function Quiz() {
   const canSubmit = answers.length === totalQuestions && answers.every(a => a);
 
   const handleSubmit = async () => {
+    // CRITICAL FIX: Prevent duplicate submissions
+    if (submitted || loading) {
+      console.log('Submission already in progress or completed');
+      return;
+    }
+    
     setLoading(true);
+    setSubmitted(true);
     setStudentAnswers(answers);
     
     try {
       const response = await submitQuiz(answers);
       setLastEvaluation(response);
-      setQuizPending(false); // Clear pending status after successful submission
+      setQuizPending(false);
       
-      // Add results as a chat message instead of navigating to /results
       const evaluation = response.evaluation || {};
-      // STEP 1 FIX: Use correct field names from backend
       const score = evaluation.correct_answers || 0;
       const total = evaluation.total_questions || 0;
       const percentage = total > 0 ? Math.round((score / total) * 100) : 0;
@@ -66,20 +72,26 @@ Ready to continue learning? Click "Next Step" to proceed!
         setPlannerReason(response.planner_reasoning);
       }
       
-      // Navigate back to learning page
-      navigate('/learn');
+      // Small delay to show "submitted" feedback before navigating
+      setTimeout(() => {
+        navigate('/learn');
+      }, 800);
     } catch (error) {
       console.error('Failed to submit quiz:', error);
-      setQuizPending(false); // Also clear on error to avoid stuck state
+      setQuizPending(false);
+      setSubmitted(false); // Allow retry on error
     } finally {
       setLoading(false);
     }
   };
 
-  if (loading) {
+  if (loading || submitted) {
     return (
       <div className="min-h-screen flex items-center justify-center bg-background">
-        <LoadingSpinner message="Evaluating your answers..." size="lg" />
+        <LoadingSpinner 
+          message={submitted ? "✅ Submitted! Evaluating your answers..." : "Evaluating your answers..."} 
+          size="lg" 
+        />
       </div>
     );
   }
@@ -143,9 +155,10 @@ Ready to continue learning? Click "Next Step" to proceed!
             {currentQuestion === totalQuestions - 1 ? (
               <Button
                 onClick={handleSubmit}
-                disabled={!canSubmit}
+                disabled={!canSubmit || submitted || loading}
+                className={submitted ? 'bg-green-600 hover:bg-green-700' : ''}
               >
-                Submit Quiz
+                {submitted ? '✅ Submitted!' : 'Submit Quiz'}
                 <Send className="ml-2 h-4 w-4" />
               </Button>
             ) : (

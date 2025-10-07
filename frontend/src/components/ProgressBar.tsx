@@ -143,16 +143,17 @@ export const ProgressBar: React.FC<ProgressBarProps> = ({
   showLabels = true,
   variant = 'default'
 }) => {
-  const progressPercentage = total > 0 ? (completed / total) * 100 : 0;
+  // Calculate progress based on current step
+  const progressPercentage = total > 0 ? ((current + 1) / total) * 100 : 0;
   const currentIndex = Math.min(current, total - 1);
 
-  // Generate progress items
+  // Generate progress items (for non-minimal variants)
   const items = Array.from({ length: total }, (_, index) => {
     let status: 'completed' | 'current' | 'pending' = 'pending';
     
-    if (index < completed) {
+    if (index < current) {
       status = 'completed';
-    } else if (index === currentIndex) {
+    } else if (index === current) {
       status = 'current';
     }
 
@@ -208,38 +209,26 @@ export const ProgressBar: React.FC<ProgressBarProps> = ({
     );
   }
 
-  // Default variant
+  // Default variant - Clean and minimal
   return (
     <div className={cn("w-full", className)}>
       {showLabels && (
         <div className="flex justify-between items-center mb-2">
-          <span className="text-sm font-medium text-gray-700">Progress</span>
-          <span className="text-sm text-gray-500">
-            {completed} of {total} completed
+          <span className="text-xs font-medium text-muted-foreground">
+            Step {current + 1} of {total}
+          </span>
+          <span className="text-xs text-muted-foreground">
+            {Math.round(progressPercentage)}% complete
           </span>
         </div>
       )}
       
-      {/* Progress bar */}
-      <div className="w-full bg-gray-200 rounded-full h-2 mb-4">
+      {/* Clean progress bar */}
+      <div className="w-full bg-muted rounded-full h-1.5 overflow-hidden">
         <div
-          className="bg-blue-600 h-2 rounded-full transition-all duration-300 ease-in-out"
+          className="bg-primary h-full rounded-full transition-all duration-500 ease-out"
           style={{ width: `${progressPercentage}%` }}
         />
-      </div>
-
-      {/* Progress items */}
-      <div className="flex items-center justify-between">
-        {items.map((item, index) => (
-          <ProgressItem
-            key={item.index}
-            index={item.index}
-            label={item.label}
-            status={item.status}
-            isLast={index === items.length - 1}
-            variant="default"
-          />
-        ))}
       </div>
     </div>
   );

@@ -24,6 +24,9 @@ class AskQuestionRequest(BaseModel):
 
 class ExecuteStepRequest(BaseModel):
     step_index: Optional[int] = None
+    exercise_answers: Optional[List[str]] = None  # Optional exercise answers from previous segment
+    last_topic: Optional[str] = None  # Topic of previous segment (for exercise evaluation)
+    last_segment_id: Optional[str] = None  # Segment ID of previous segment
 
 class SubmitExerciseRequest(BaseModel):
     topic: str
@@ -142,7 +145,32 @@ async def start_from_saved(req: StartFromSavedRequest):
 @router.post("/execute-step")
 async def execute_step(request: ExecuteStepRequest):
     """Execute the next step in the study plan"""
+    # Clear agent thoughts from previous request
+    from app.core.agent_thoughts import thoughts_tracker
+    thoughts_tracker.clear()
+    
     try:
+        # OPTIMIZATION: Spawn async exercise evaluation with context reuse
+        if request.exercise_answers and request.last_topic and request.last_segment_id:
+            import asyncio
+            # Try to get context from current state to avoid Redis fetch
+            taught_context = None
+            try:
+                segment_key = f"{request.last_topic}:{request.last_segment_id}"
+                taught_context = workflow_orchestrator.current_state.taught_content.get(segment_key)
+            except:
+                pass
+            
+            asyncio.create_task(
+                workflow_orchestrator.evaluate_exercise_answers_async(
+                    topic=request.last_topic,
+                    segment_id=request.last_segment_id,
+                    exercise_answers=request.exercise_answers,
+                    taught_context=taught_context  # Reuse context!
+                )
+            )
+            print(f"[API] 🚀 Spawned exercise evaluation (context={'reused' if taught_context else 'will fetch'})")
+        
         result = await workflow_orchestrator.execute_plan_step(
             step_index=request.step_index
         )
@@ -160,6 +188,9 @@ async def execute_step(request: ExecuteStepRequest):
             except Exception:
                 print(f"[API] execute-step error payload (non-json): {result}")
             raise HTTPException(status_code=400, detail=result.get("error", "Unknown error"))
+        
+        # Add agent thoughts to response
+        result["agent_thoughts"] = thoughts_tracker.get_all()
         
         return result
         
@@ -191,6 +222,10 @@ async def submit_quiz_answers(request: SubmitAnswersRequest):
 @router.post("/ask-question")
 async def ask_question(request: AskQuestionRequest):
     """Ask a question to the tutor"""
+    # Clear agent thoughts from previous request
+    from app.core.agent_thoughts import thoughts_tracker
+    thoughts_tracker.clear()
+    
     try:
         result = await workflow_orchestrator.answer_student_question(
             question=request.question,
@@ -199,6 +234,9 @@ async def ask_question(request: AskQuestionRequest):
         
         if not result["success"]:
             raise HTTPException(status_code=400, detail=result["error"])
+        
+        # Add agent thoughts to response
+        result["agent_thoughts"] = thoughts_tracker.get_all()
         
         return result
         
