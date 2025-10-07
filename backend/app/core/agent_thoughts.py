@@ -3,33 +3,37 @@ Agent Thoughts Tracker - Capture and expose AI decision-making in real-time
 """
 from typing import List, Dict, Any
 from datetime import datetime
-import threading
+from contextvars import ContextVar
+
+# Context variable for async-safe per-request storage
+_thoughts_context: ContextVar[List[Dict[str, Any]]] = ContextVar('thoughts', default=[])
 
 class AgentThoughtsTracker:
     """
-    Thread-safe singleton to capture agent thoughts/decisions during a request.
-    Thoughts are stored per-request and returned in API responses.
+    Async-safe singleton to capture agent thoughts/decisions during a request.
+    Uses contextvars for proper async context isolation.
     """
-    _local = threading.local()
     
     @classmethod
     def clear(cls):
         """Clear thoughts for current request"""
-        cls._local.thoughts = []
+        _thoughts_context.set([])
     
     @classmethod
     def add(cls, agent: str, thought: str, emoji: str = "🤔", metadata: Dict[str, Any] = None):
         """Add a thought from an agent"""
-        if not hasattr(cls._local, 'thoughts'):
-            cls._local.thoughts = []
+        thoughts = _thoughts_context.get()
         
-        cls._local.thoughts.append({
+        new_thought = {
             "agent": agent,
             "thought": thought,
             "emoji": emoji,
             "timestamp": datetime.now().isoformat(),
             "metadata": metadata or {}
-        })
+        }
+        
+        thoughts.append(new_thought)
+        _thoughts_context.set(thoughts)
         
         # Also print to console for debugging
         print(f"[{agent}] {emoji} {thought}")
@@ -37,9 +41,7 @@ class AgentThoughtsTracker:
     @classmethod
     def get_all(cls) -> List[Dict[str, Any]]:
         """Get all thoughts for current request"""
-        if not hasattr(cls._local, 'thoughts'):
-            return []
-        return cls._local.thoughts
+        return _thoughts_context.get()
     
     @classmethod
     def get_summary(cls) -> str:

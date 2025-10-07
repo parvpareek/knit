@@ -27,6 +27,13 @@ class LLMPlannerAgent:
         self.memory = memory  # Redis memory for reading segment plans
         self.name = "LLMPlannerAgent"
         
+        # Agentic components for adaptive remediation
+        from app.agents.diagnostic_agent import DiagnosticAgent
+        from app.agents.strategy_generator import StrategyGenerator
+        
+        self.diagnostic_agent = DiagnosticAgent(llm=llm)
+        self.strategy_generator = StrategyGenerator(llm=llm)
+        
         # Track plan execution state
         self.current_plan = None
         self.completed_steps = []
@@ -155,7 +162,7 @@ class LLMPlannerAgent:
                     if not hasattr(self, 'remediation_tracker'):
                         self.remediation_tracker = {}
                     
-                    # Remediate up to 2 most problematic segments
+                    # 🧠 AGENTIC REMEDIATION: Use diagnostic + strategy agents
                     for seg in unclear_segments[:2]:
                         # Check if already remediated once
                         already_remediated = self.remediation_tracker.get(f"{topic}:{seg}", 0)
@@ -163,21 +170,44 @@ class LLMPlannerAgent:
                             print(f"[{self.name}] Segment {seg} already remediated {already_remediated} times, moving on")
                             continue
                         
-                        # Determine remediation strategy based on performance
-                        perf = segment_perf.get(seg, {})
-                        accuracy = perf.get("correct", 0) / perf.get("total", 1) if perf.get("total") else 0
+                        # Get student context
+                        student_questions = student_questions or []
+                        past_attempts = self._get_past_remediation_attempts(topic, seg)
                         
-                        # Choose remediation approach
-                        if accuracy == 0:
-                            strategy = "fundamentals"
-                            why = f"Re-teach {seg} from scratch - fundamental misunderstanding detected"
-                        elif accuracy < 0.3:
-                            strategy = "examples"
-                            why = f"Re-explain {seg} with concrete examples - concept unclear"
-                        else:
-                            strategy = "practice"
-                            why = f"Targeted practice for {seg} - partial understanding"
+                        # STEP 1: Diagnose the confusion
+                        try:
+                            diagnosis = await self.diagnostic_agent.analyze_confusion(
+                                quiz_results=quiz_results,
+                                segment_id=seg,
+                                topic=topic,
+                                student_questions=student_questions,
+                                past_attempts=past_attempts
+                            )
+                            print(f"[{self.name}] 🔍 Diagnosis for {seg}: {diagnosis.get('root_cause', 'unknown')[:80]}")
+                        except Exception as e:
+                            print(f"[{self.name}] Diagnosis failed for {seg}: {e}, using fallback")
+                            diagnosis = {"root_cause": "comprehension issue", "recommended_approach": {"style": "step-by-step"}}
                         
+                        # STEP 2: Generate custom strategy
+                        try:
+                            student_profile = self._get_student_profile()
+                            strategy_data = await self.strategy_generator.generate_strategy(
+                                diagnosis=diagnosis,
+                                segment_id=seg,
+                                topic=topic,
+                                student_profile=student_profile
+                            )
+                            approach_name = strategy_data.get("approach_name", "Custom Approach")
+                            custom_prompt = strategy_data.get("custom_prompt", "")
+                            teaching_hook = strategy_data.get("teaching_hook", "")
+                            print(f"[{self.name}] 🎯 Strategy for {seg}: {approach_name}")
+                        except Exception as e:
+                            print(f"[{self.name}] Strategy generation failed for {seg}: {e}, using fallback")
+                            approach_name = "Adaptive Re-teaching"
+                            custom_prompt = f"Re-teach {seg} with clear examples and step-by-step explanations"
+                            teaching_hook = f"Let's revisit {seg} with a clearer approach"
+                        
+                        # STEP 3: Insert remediation step with custom strategy
                         adapted_plan.insert(self._current_index_or_end(), {
                             "step_id": f"remediate_{seg}_{already_remediated+1}",
                             "action": "study_segment",
@@ -187,13 +217,19 @@ class LLMPlannerAgent:
                             "segment_title": f"Re-learn: {seg}",
                             "difficulty": "easy",
                             "est_minutes": 5,
-                            "remediation_strategy": strategy,  # NEW: teaching approach hint
-                            "why_assigned": why
+                            "agentic_strategy": {  # NEW: AI-generated strategy
+                                "diagnosis": diagnosis,
+                                "approach_name": approach_name,
+                                "custom_prompt": custom_prompt,
+                                "teaching_hook": teaching_hook,
+                                "strategy_data": strategy_data
+                            },
+                            "why_assigned": f"🧠 {approach_name}: {diagnosis.get('root_cause', 'addressing confusion')[:100]}"
                         })
                         
                         # Track remediation
                         self.remediation_tracker[f"{topic}:{seg}"] = already_remediated + 1
-                        print(f"[{self.name}] 🔄 Inserting remediation for {seg}: strategy={strategy}, attempt={already_remediated+1}")
+                        print(f"[{self.name}] 🔄 Inserting agentic remediation for {seg}: {approach_name}, attempt={already_remediated+1}")
                 else:
                     adapted_plan = await self._llm_adapt_plan(
                         current_plan=self.current_plan,
@@ -234,6 +270,13 @@ class LLMPlannerAgent:
                             "why_assigned": "Continue with next segment"
                         })
                         self.current_plan = current_plan_copy
+                        return PlannerResponse(
+                            success=True,
+                            plan=self.current_plan,
+                            reasoning=self.last_decision_reason or "Progress is good, continuing with next segment",
+                            next_action="continue_plan",
+                            evaluation=evaluation
+                        )
                     else:
                         # No more segments, move to next concept
                         print(f"[{self.name}] No more segments, moving to next concept...")
@@ -262,13 +305,14 @@ class LLMPlannerAgent:
                                 evaluation=evaluation
                             )
                 
-                    return PlannerResponse(
-                        success=True,
-                        plan=self.current_plan,
-                        reasoning=self.last_decision_reason or "Progress is good, continuing with current plan",
-                        next_action="continue_plan",
-                        evaluation=evaluation
-                    )
+                # Plan has remaining steps, continue with current plan
+                return PlannerResponse(
+                    success=True,
+                    plan=self.current_plan,
+                    reasoning=self.last_decision_reason or "Progress is good, continuing with current plan",
+                    next_action="continue_plan",
+                    evaluation=evaluation
+                )
             
             elif next_action == "move_forward":
                 # Student has mastered this concept, move to next major concept
@@ -772,7 +816,7 @@ Format: ACTION: reasoning"""
                     
                     # Log planner thinking
                     from app.core.agent_thoughts import thoughts_tracker
-                    thoughts_tracker.add("Planner", f"Decision: {action} - {reasoning[:80]}", "🎯", {
+                    thoughts_tracker.add("Planner", f"{action.replace('_', ' ').title()}: {reasoning[:100]}", "🎯", {
                         "action": action,
                         "full_reasoning": reasoning
                     })
@@ -846,9 +890,31 @@ Format: ACTION: reasoning"""
     def _get_student_profile(self) -> Dict:
         """Get current student profile"""
         try:
-            return self.db.get_topic_proficiency()
+            profile = self.db.get_topic_proficiency()
+            # TODO: Add successful strategies from feedback loop (Phase 3)
+            return profile
         except:
             return {}
+    
+    def _get_past_remediation_attempts(self, topic: str, segment_id: str) -> List[Dict]:
+        """Get history of remediation attempts for this segment"""
+        attempts = []
+        
+        # Look through completed steps for past remediation attempts
+        for step in self.completed_steps:
+            if (step.get("action") == "study_segment" and 
+                step.get("topic") == topic and
+                step.get("segment_id") == segment_id and
+                "agentic_strategy" in step):
+                
+                attempts.append({
+                    "strategy": step["agentic_strategy"].get("approach_name", "unknown"),
+                    "diagnosis": step["agentic_strategy"].get("diagnosis", {}),
+                    "score": step.get("quiz_score"),  # If available
+                    "timestamp": step.get("timestamp")
+                })
+        
+        return attempts
     
     def _format_profile_for_llm(self, profile: Dict) -> str:
         """Format student profile for LLM"""

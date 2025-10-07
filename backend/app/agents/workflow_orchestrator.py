@@ -58,16 +58,22 @@ class WorkflowOrchestrator:
         self.use_adaptive_graph = True  # Feature flag - ENABLED
 
     def _extract_full_text_from_possible_json(self, raw: str) -> str:
-        """If raw looks like JSON (possibly fenced), extract full_text; otherwise return raw."""
+        """If raw looks like JSON (possibly fenced), extract content/full_text; otherwise return raw."""
         try:
             content_raw = (raw or "").strip()
-            # Prefer fenced block capture
+            
+            # Step 1: Remove code fences if present
             if '```json' in content_raw:
                 start = content_raw.find('```json') + len('```json')
                 end = content_raw.find('```', start)
                 if end != -1:
                     content_raw = content_raw[start:end].strip()
-            # Try object parse
+            elif '```' in content_raw and content_raw.startswith('```'):
+                parts = content_raw.split('```')
+                if len(parts) >= 2:
+                    content_raw = parts[1].strip()
+            
+            # Step 2: Extract JSON object if wrapped in text
             import json as _json
             import re as _re
             obj_txt = content_raw
@@ -75,11 +81,28 @@ class WorkflowOrchestrator:
                 m = _re.search(r"\{[\s\S]*\}", content_raw)
                 if m:
                     obj_txt = m.group(0)
+            
+            # Step 3: Parse and extract content field
             obj = _json.loads(obj_txt)
-            if isinstance(obj, dict) and obj.get("full_text"):
-                return obj.get("full_text", "")
-        except Exception:
-            pass
+            if isinstance(obj, dict):
+                # Try 'content' field first (new format), then 'full_text' (old format)
+                extracted = obj.get("content") or obj.get("full_text")
+                if extracted:
+                    print(f"[WORKFLOW] 🔍 Extracted content from JSON (prevented JSON from showing to user)")
+                    return extracted
+        except Exception as e:
+            # If it looks like JSON but we can't parse it, try regex extraction
+            if raw.strip().startswith('{'):
+                try:
+                    import re as _re
+                    content_match = _re.search(r'"content"\s*:\s*"((?:[^"\\]|\\.)*)"', raw, _re.DOTALL)
+                    if content_match:
+                        extracted = content_match.group(1).replace('\\"', '"').replace('\\n', '\n')
+                        print(f"[WORKFLOW] 🔍 Extracted content via regex (JSON parse failed)")
+                        return extracted
+                except:
+                    pass
+        
         return raw
     
     def _generate_search_queries(self, topic: str) -> List[str]:
@@ -1165,15 +1188,38 @@ Return ONLY JSON (no code fences):
         engagement_profile = self._get_engagement_profile_cached(topic)
         complexity_instruction = ""  # Removed difficulty-based complexity adjustment
         
-        # Check for remediation strategy first (overrides normal teaching)
-        remediation_strategy = step.get("remediation_strategy", None)
+        # Check for agentic strategy (AI-generated) OR old remediation strategy
+        agentic_strategy = step.get("agentic_strategy", None)
+        remediation_strategy = step.get("remediation_strategy", None) if not agentic_strategy else None
         teaching_strategy = ""
+        custom_prompt_override = None  # Will override the standard prompt if set
         
         # Track teaching decision
         from app.core.agent_thoughts import thoughts_tracker
         
-        if remediation_strategy:
-            # REMEDIATION: Use specific strategy to re-teach unclear segment
+        if agentic_strategy:
+            # 🧠 AGENTIC REMEDIATION: Use AI-generated custom strategy
+            approach_name = agentic_strategy.get("approach_name", "Custom Approach")
+            custom_prompt = agentic_strategy.get("custom_prompt", "")
+            teaching_hook = agentic_strategy.get("teaching_hook", "")
+            diagnosis = agentic_strategy.get("diagnosis", {})
+            root_cause = diagnosis.get("root_cause", "addressing confusion")
+            
+            # Use the custom prompt as the primary teaching instruction
+            custom_prompt_override = custom_prompt
+            teaching_strategy = f"\n**🧠 AGENTIC STRATEGY: {approach_name}**\n{teaching_hook}\n"
+            
+            thoughts_tracker.add("Workflow", f"Using AI-generated strategy '{approach_name}' for {segment_id}", "🧠", {
+                "approach": approach_name,
+                "segment": segment_id,
+                "root_cause": root_cause[:100]
+            })
+            
+            print(f"[WORKFLOW] 🧠 Using agentic strategy '{approach_name}' for {segment_id}")
+            print(f"[WORKFLOW] Root cause: {root_cause[:100]}")
+            
+        elif remediation_strategy:
+            # FALLBACK: Old hardcoded remediation (for backward compatibility)
             if remediation_strategy == "fundamentals":
                 teaching_strategy = """
 **🔄 REMEDIATION: FUNDAMENTALS** - Student showed fundamental misunderstanding.
@@ -1211,7 +1257,7 @@ Return ONLY JSON (no code fences):
                     "segment": segment_id
                 })
             
-            print(f"[WORKFLOW] 🔄 Using remediation strategy: {remediation_strategy} for {segment_id}")
+            print(f"[WORKFLOW] 🔄 Using fallback remediation strategy: {remediation_strategy} for {segment_id}")
         else:
             # Normal teaching strategy based on engagement
             if engagement_profile:
@@ -1251,7 +1297,33 @@ Return ONLY JSON (no code fences):
             if covered:
                 prior_context = f"(Previous segments: {', '.join(covered)})\n"
         
-        segment_prompt = f"""You are teaching "{segment_title}" to a student learning {topic}.
+        # Use custom AI-generated prompt if available (agentic mode)
+        if custom_prompt_override:
+            segment_prompt = f"""You are teaching "{segment_title}" to a student learning {topic}.
+
+{prior_context}
+CURRENT SEGMENT: {segment_title}
+
+DOCUMENT CONTENT:
+{study_content[:2000]}
+
+🧠 CUSTOM TEACHING INSTRUCTION (AI-Generated Strategy):
+{custom_prompt_override}
+
+CRITICAL: Follow the custom instruction above precisely. Return ONLY a JSON object with these EXACT keys (no markdown, no code fences):
+{{
+  "content": "Your explanation following the custom instruction above. Minimum 300-500 words with examples and clarity as specified.",
+  "summary": "One sentence summary capturing the key insight",
+  "exercises": [
+    {{"question": "One conceptual question", "difficulty": "medium"}}
+  ],
+  "memory_delta": "Brief summary of what was covered. 10-15 words"
+}}
+
+Start your response with {{ and end with }}. Nothing else!"""
+        else:
+            # Standard prompt (non-remediation)
+            segment_prompt = f"""You are teaching "{segment_title}" to a student learning {topic}.
 
 {prior_context}
 CURRENT SEGMENT: {segment_title}
@@ -1267,7 +1339,7 @@ TEACHING PRIORITIES:
 2. Ground explanation in DOCUMENT CONTENT above
 3. Adapt to student's learning style (see strategy)
 4. Pre-empt common confusions with clear examples
-5. PRIORITIZE detailed, thorough content explanation (minimum 250 words)
+5. PRIORITIZE detailed, thorough content explanation (minimum 300 words)
 
 PROACTIVE TEACHING:
 - Anticipate where students typically struggle with {segment_title}
@@ -1282,8 +1354,6 @@ CRITICAL: Return ONLY a JSON object with these EXACT keys (no markdown, no code 
   "summary": "One sentence summary capturing the key insight",
   "exercises": [
     {{"question": "One conceptual question", "difficulty": "medium"}}
-    {{"question": "One application question", "difficulty": "medium"}}
-
   ],
   "memory_delta": "Brief summary of what was covered. 10-15 words"
 }}
@@ -1307,32 +1377,37 @@ Start your response with {{ and end with }}. Nothing else!"""
             )
             duration = time.time() - start_time
             
-            # Parse JSON response
+            # Parse JSON response with robust extraction
             parsed = None
             try:
                 content_raw = segment_response.content.strip()
-                # Remove code fences if present
-                if content_raw.startswith("```"):
-                    if '```json' in content_raw:
-                        content_raw = content_raw.split('```json', 1)[1]
-                    parts = content_raw.split('```')
+                
+                # Step 1: Remove markdown code fences
+                if "```json" in content_raw:
+                    start = content_raw.index("```json") + 7
+                    end = content_raw.rindex("```")
+                    content_raw = content_raw[start:end].strip()
+                elif "```" in content_raw and content_raw.startswith("```"):
+                    parts = content_raw.split("```")
                     if len(parts) >= 2:
                         content_raw = parts[1].strip()
                 
-                # Extract JSON object if wrapped in text
-                if not content_raw.startswith('{'):
-                    import re
-                    m = re.search(r"\{[\s\S]*\}", content_raw)
-                    if m:
-                        content_raw = m.group(0)
+                # Step 2: Extract JSON object (find first { to last })
+                if '{' in content_raw and '}' in content_raw:
+                    start_idx = content_raw.index('{')
+                    end_idx = content_raw.rindex('}') + 1
+                    content_raw = content_raw[start_idx:end_idx]
                 
+                # Step 3: Parse JSON
                 parsed = json.loads(content_raw)
+                print(f"[WORKFLOW] ✅ Successfully parsed JSON response")
+                
             except json.JSONDecodeError as e:
-                print(f"[WORKFLOW] JSON parse error: {e}")
-                print(f"[WORKFLOW] Raw response (first 500 chars): {content_raw[:500]}")
+                print(f"[WORKFLOW] ❌ JSON parse error: {e}")
+                print(f"[WORKFLOW] Raw response (first 500 chars): {content_raw[:500] if 'content_raw' in locals() else 'N/A'}")
                 parsed = None
             except Exception as e:
-                print(f"[WORKFLOW] Parse error: {e}")
+                print(f"[WORKFLOW] ❌ Parse error: {e}")
                 parsed = None
             
             # Extract content from parsed JSON or use raw response
@@ -1352,16 +1427,13 @@ Start your response with {{ and end with }}. Nothing else!"""
                 print(f"  - Summary: {bool(summary_text)}")
                 print(f"  - Memory delta: {bool(session_summary_delta)}")
                 print(f"  - Exercises: {len(exercises)}")
+                if exercises:
+                    print(f"  - First exercise: {exercises[0]}")
+                else:
+                    print(f"  - WARNING: No exercises in parsed JSON!")
+                    print(f"  - Parsed keys: {list(parsed.keys())}")
                 
-                # Warn if content is too short
-                if word_count < 500:
-                    print(f"[WORKFLOW] ⚠️ WARNING: Content is only {word_count} words (target: 800+)")
-                    from app.core.agent_thoughts import thoughts_tracker
-                    thoughts_tracker.add("Workflow", f"⚠️ Short content generated: {word_count} words (target: 800+)", "⚠️", {
-                        "word_count": word_count,
-                        "segment": segment_id
-                    })
-                
+                # Warn if content is too                 
                 # Store structured taught segment
                 if self.memory:
                     try:
@@ -1398,10 +1470,26 @@ Start your response with {{ and end with }}. Nothing else!"""
                     "exercises": exercises
                 }
             else:
-                # Fallback: use raw content
-                print(f"[WORKFLOW] ⚠️ JSON parsing failed, using raw content")
-                segment_explanation = segment_response.content
-                summary_text = f"{segment_title}: {(segment_response.content or '').strip()[:120]}"
+                # Fallback: try to extract content even from malformed JSON
+                print(f"[WORKFLOW] ⚠️ JSON parsing failed, attempting content extraction")
+                raw_content = segment_response.content
+                
+                # Try to extract just the content field value using regex
+                import re
+                content_match = re.search(r'"content"\s*:\s*"((?:[^"\\]|\\.)*)"', raw_content, re.DOTALL)
+                if content_match:
+                    # Found content field in JSON
+                    segment_explanation = content_match.group(1).replace('\\"', '"').replace('\\n', '\n')
+                    print(f"[WORKFLOW] ✅ Extracted content field from malformed JSON")
+                elif raw_content.strip().startswith('{'):
+                    # It's JSON but we couldn't parse it - don't show JSON to user!
+                    segment_explanation = f"I apologize, but I encountered an error generating the explanation for {segment_title}. Let me try to explain this concept briefly: {segment_info.get('learning_objectives', ['this topic'])[0] if segment_info.get('learning_objectives') else 'this important concept'}."
+                    print(f"[WORKFLOW] ❌ Could not extract content from JSON, using error message")
+                else:
+                    # Use raw content if it's not JSON
+                    segment_explanation = raw_content
+                
+                summary_text = f"{segment_title}: basic explanation"
                 memory_patch = {}
                 exercises = []
                 parsed = None  # Ensure parsed is None for later checks
@@ -1498,18 +1586,6 @@ Start your response with {{ and end with }}. Nothing else!"""
                     text=summary_text,
                     metadata={"doc_id": self.current_state.doc_id, "topic": topic, "segment_id": segment_id}
                 )
-            except Exception:
-                pass
-            # Push last-k summary if available
-            try:
-                if summary_text:
-                    self.memory.push_session_summary({
-                        "segment_id": segment_id,
-                        "topic": topic,
-                        "summary": summary_text,
-                        "timestamp": time.time(),
-                        "memory_delta": memory_patch.get("session_summary_delta")
-                    }, k=3)
             except Exception:
                 pass
         
@@ -2276,21 +2352,25 @@ Base your assessment on answer quality and depth of understanding."""
                             "next_action": "complete",
                             "message": f"🎉 Quiz completed! Score: {score_percentage:.1f}%. You've finished all available content!"
                         }
-                else:
-                    # Move to next step
-                    self.current_state.current_step += 1
-                    
-                    return {
-                        "success": True,
-                        "evaluation": evaluation,
-                        "profile_updated": profile_result.success,
-                        "next_action": next_action,
-                        "planner_reasoning": adaptation_result.reasoning,
-                        "planner_reason": adaptation_result.reasoning,  # For frontend compatibility
-                        "planner_evaluation": adaptation_result.evaluation,
-                        "adapted_plan": adaptation_result.plan if next_action == "adapt_plan" else None,
-                        "message": f"Quiz completed! Score: {score_percentage:.1f}%. {adaptation_result.reasoning}"
-                    }
+            
+            # Move to next step (or stay at 0 if we just recovered)
+            if adaptation_result.plan and self.current_state.current_step >= len(self.current_state.study_plan) - 1:
+                self.current_state.current_step = 0  # Reset for new concept
+            elif adaptation_result.plan:
+                self.current_state.current_step += 1
+            
+            # Return success response
+            return {
+                "success": True,
+                "evaluation": evaluation,
+                "profile_updated": profile_result.success,
+                "next_action": next_action,
+                "planner_reasoning": adaptation_result.reasoning,
+                "planner_reason": adaptation_result.reasoning,  # For frontend compatibility
+                "planner_evaluation": adaptation_result.evaluation,
+                "adapted_plan": adaptation_result.plan if next_action == "adapt_plan" else None,
+                "message": f"Quiz completed! Score: {score_percentage:.1f}%. {adaptation_result.reasoning}"
+            }
         else:
             # Move to next step even if adaptation fails
             self.current_state.current_step += 1

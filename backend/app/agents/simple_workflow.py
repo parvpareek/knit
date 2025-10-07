@@ -1191,11 +1191,30 @@ Make your answer clear, actionable, and adapted to their confusion type!"""
         print(f"[{self.name}] Generating {num_questions} {difficulty} questions for {topic} (subjective={include_subjective})")
         print(f"[{self.name}] Using {'taught content' if taught_content else 'retrieved context'} for grounding")
         
+        from app.core.agent_thoughts import thoughts_tracker
+        
         # Parse student context for targeted questions
         student_context = student_context or {}
         student_questions = student_context.get("recent_questions", [])
         unclear_segments = student_context.get("unclear_segments", [])
         confusion_areas = student_context.get("confusion_areas", [])
+        
+        # Log quiz generation strategy
+        context_sources = []
+        if taught_content:
+            context_sources.append(f"{len(taught_content)} chars of taught content")
+        if student_questions:
+            context_sources.append(f"{len(student_questions)} student questions")
+        if unclear_segments:
+            context_sources.append(f"{len(unclear_segments)} unclear segments")
+        
+        if context_sources:
+            thoughts_tracker.add(
+                "Tutor",
+                f"Generating {num_questions} {difficulty} quiz questions using: {', '.join(context_sources)}",
+                "📝",
+                {"difficulty": difficulty, "subjective": include_subjective, "topic": topic}
+            )
         
         if student_questions or unclear_segments or confusion_areas:
             print(f"[{self.name}] Using student context: {len(student_questions)} questions, {len(unclear_segments)} unclear, {len(confusion_areas)} confusions")
@@ -1489,17 +1508,33 @@ SUBJECTIVE QUESTIONS should:
                 })
             
             # Identify unclear segments (segments with <50% accuracy)
+            from app.core.agent_thoughts import thoughts_tracker
+            
             for segment, perf in segment_performance.items():
                 if segment != "general" and perf["total"] > 0:
                     accuracy = perf["correct"] / perf["total"]
                     if accuracy < 0.5:  # Less than 50% correct
                         unclear_segments.append(segment)
                         print(f"[{self.name}] ⚠️ Unclear segment: {segment} ({perf['correct']}/{perf['total']})")
+                        thoughts_tracker.add(
+                            "Evaluator", 
+                            f"Student struggled with '{segment}' ({int(accuracy*100)}% correct) - needs remediation",
+                            "⚠️",
+                            {"segment": segment, "accuracy": accuracy, "correct": perf["correct"], "total": perf["total"]}
+                        )
             
             # Calculate score (only count MCQ questions for now)
             mcq_count = sum(1 for q in questions if q.get("type", "mcq") == "mcq")
             total_questions = mcq_count if mcq_count > 0 else len(questions)
             score_percentage = (correct_count / total_questions) * 100 if total_questions > 0 else 0
+            
+            # Log overall performance
+            if score_percentage >= 80:
+                thoughts_tracker.add("Evaluator", f"Strong performance: {int(score_percentage)}% - student mastered the topic", "✅")
+            elif score_percentage >= 60:
+                thoughts_tracker.add("Evaluator", f"Moderate performance: {int(score_percentage)}% - some concepts need reinforcement", "📊")
+            else:
+                thoughts_tracker.add("Evaluator", f"Needs help: {int(score_percentage)}% - recommend re-teaching key concepts", "🔄")
             
             evaluation = {
                 "quiz_id": quiz.get("quiz_id"),
