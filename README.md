@@ -2,6 +2,11 @@
 
 Minimal setup to run the hierarchical extractor, backend API, and frontend UI.
 
+
+### Demo Video
+
+[![Demo Video](https://img.youtube.com/vi/wEEMZnU0OZc/0.jpg)](https://www.youtube.com/watch?v=wEEMZnU0OZc)
+
 ### 1) Start the Hierarchical Extractor (NLM Ingestor)
 
 - Pull the Docker image (public GHCR):
@@ -52,3 +57,6 @@ npm run dev
 
 # knit
 Agentic AI Tutor for Adaptive Learning in EdTech
+
+.env file
+```

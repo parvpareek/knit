@@ -15,7 +15,7 @@ interface AgentThoughtsProps {
 }
 
 export function AgentThoughts({ thoughts }: AgentThoughtsProps) {
-  const [isExpanded, setIsExpanded] = useState(false);
+  const [isExpanded, setIsExpanded] = useState(true); // Auto-expand to show agent thinking
 
   if (!thoughts || thoughts.length === 0) return null;
 
